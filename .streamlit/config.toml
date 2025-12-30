@@ -1,5 +1,9 @@
+
 [server]
 port = 5035
+sslCertFile = "/etc/nginx/ssl/datapai_fullchain.crt"
+sslKeyFile = "/etc/nginx/ssl/private.key"
+
 [theme]
 primaryColor="#2af598"
 backgroundColor="#111827"

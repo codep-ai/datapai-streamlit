@@ -2,3 +2,19 @@ vanna
 streamlit
 streamlit_code_editor
 python-dotenv
+#streamlit>=1.33
+pandas
+requests
+s3fs
+boto3
+# If your text-to-sql stack needs extra libs, add them here
+pytesseract
+pillow
+unstructured
+lancedb
+langchain
+sqlglot
+opencv-python
+code_editor
+unstructured_inference
+pikepdf

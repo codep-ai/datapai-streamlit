@@ -99,10 +99,8 @@ class VannaDefault(VannaBase):
         conn =connect_to_db(selected_db)
         return conn
 
-    def is_sql_valid(self, sql: str, selected_db: str):
+    def is_sql_valid_old(self, sql: str, selected_db: str):
         try:
-            if 'SQL' not in st.session_state:
-                st.session_state["SQL"] = sql
             # Connect to the selected database
             conn = connect_to_db(selected_db)
 
@@ -119,7 +117,7 @@ class VannaDefault(VannaBase):
             print(f"SQL Validation Error: {e}")
             return False
 
-    def is_sql_valid2(self, sql: str):
+    def is_sql_valid(self, sql: str):
         try:
             # Here, you would actually execute the query in a safe way to check its validity
             # For example, if using SQLite:
@@ -430,6 +428,58 @@ class VannaDefault(VannaBase):
         plotly_code = PlotlyResult(**d["result"])
 
         return plotly_code.plotly_code
+
+    def generate_dbt_code(
+        self, question: str = None, sql: str = None, table_metadata: str = None, **kwargs
+    ) -> str:
+        """
+        **Example:**
+        ```python
+        vn.generate_dbt_code(
+            question="Create a dbt model for calculating average employee salary",
+            sql="SELECT AVG(salary) FROM employees",
+            table_metadata="column details here"
+        )
+        # dbt SQL code and YAML configuration
+        ```
+
+        Generate dbt SQL and YAML code using the Vanna.AI API.
+
+        Args:
+            question (str): The question to generate dbt code for.
+            sql (str): The SQL query for the dbt model.
+            table_metadata (str): Metadata for the source table.
+            additional_instructions (str): Optional additional instructions for dbt code.
+
+        Returns:
+            str or None: The dbt SQL and YAML code, or None if an error occurred.
+        """
+        if kwargs is not None and "additional_instructions" in kwargs:
+            if question is not None:
+                question += " -- Follow these instructions for dbt: " + kwargs["additional_instructions"]
+            else:
+                question = "Follow these instructions for dbt: " + kwargs["additional_instructions"]
+
+        params = [
+            DataResult(
+                question=question,
+                sql=sql,
+                table_markdown=table_metadata,
+                error=None,
+                correction_attempts=0,
+            )
+        ]
+
+        d = self._rpc_call(method="generate_dbt_code", params=params)
+
+        if "result" not in d:
+            return None
+
+        # Load the result into a dataclass
+        dbt_code = dbtResult(**d["result"])
+
+        return dbt_code.sql_code, dbt_code.yaml_code
+
 
     def generate_question(self, sql: str, **kwargs) -> str:
         """

@@ -24,7 +24,11 @@ def generate_sql_cached(question: str, selected_db: str):
     if selected_db =='Snowflake':
         database=st.secrets["SNOWFLAKE_DATABASE"]
         schema=st.secrets["SNOWFLAKE_SCHEMA"]
-        assumption = ' in ' + selected_db + f' , assuming database name is {database} and schema name is {schema} '
+        assumption = ' in ' + selected_db + f', "_" is used to split field, assuming database name is {database} and schema name is {schema}.'
+    elif selected_db =='dbt':
+        database=st.secrets["SNOWFLAKE_DATABASE"]
+        schema=st.secrets["SNOWFLAKE_SCHEMA"]
+        assumption = ' in dbt for snowflake'  + f' ,please generate sql like dbt code instead, using dbt syntax, assuming database name is {database} and schema name is {schema} '
     elif selected_db =='Redshift':
         database=st.secrets["REDSHIFT_DBNAME"]
         schema=st.secrets["REDSHIFT_SCHEMA"]
@@ -38,8 +42,8 @@ def generate_sql_cached(question: str, selected_db: str):
 @st.cache_data(show_spinner="Checking for valid SQL ...")
 def is_sql_valid_cached(sql: str, selected_db: str):
     vn = setup_vanna()
-    return vn.is_sql_valid(sql=sql, selected_db=selected_db)
-    #return vn.is_sql_valid(sql=sql)
+    #return vn.is_sql_valid(sql=sql, selected_db=selected_db)
+    return vn.is_sql_valid(sql=sql)
 
 @st.cache_data(show_spinner="Running SQL query ...")
 def run_sql_cached(sql: str):
@@ -57,6 +61,12 @@ def generate_plotly_code_cached(question, sql, df):
     code = vn.generate_plotly_code(question=question, sql=sql, df=df)
     return code
 
+
+@st.cache_data(show_spinner="Generating dbt code ...")
+def generate_dbt_code_cached(question, sql, df):
+    vn = setup_vanna()
+    code = vn.generate_dbt_code(question=question, sql=sql, df=df)
+    return code
 
 @st.cache_data(show_spinner="Running Plotly code ...")
 def generate_plot_cached(code, df):
