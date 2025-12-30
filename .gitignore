@@ -4,3 +4,9 @@ node_modules
 .env
 .streamlit
 vector_store
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
