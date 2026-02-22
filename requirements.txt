@@ -18,3 +18,13 @@ opencv-python
 code_editor
 unstructured_inference
 pikepdf
+
+# AG2 ETL agents
+ag2
+duckdb
+openpyxl
+pyarrow
+
+# Compliance / PII
+# presidio-analyzer    # optional: install for NER-based PII detection (replaces regex)
+# presidio-anonymizer  # optional: pairs with presidio-analyzer
