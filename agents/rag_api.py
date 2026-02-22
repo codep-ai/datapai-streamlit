@@ -1,29 +1,44 @@
 """
 DataPAI RAG API — FastAPI service exposing LanceDB RAG to any client.
 
-Serves as the shared backend for:
-  1. Streamlit knowledge tab  — direct Python import (no HTTP needed)
-  2. OpenWebUI Pipeline        — called via HTTP at POST /v1/rag/query
-  3. Any external client       — standard REST API
+Infrastructure context (3-EC2 setup):
+  EC2 #1  Nginx reverse proxy / static host
+  EC2 #2  Platform (8GB/2CPU) — THIS SERVICE RUNS HERE
+            Handles: LanceDB retrieval (S3), Streamlit, Airbyte, Lightdash
+            Business hours only
+  EC2 #3  GPU instance (optional/demo) — Ollama + OpenWebUI
+            Private IP, not always running
+
+Design principle — split retrieval from generation:
+  • /v1/rag/retrieve  → LanceDB search only, returns context docs (no LLM)
+                        Called by OpenWebUI pipeline on EC2 #3 — GPU does generation locally
+  • /v1/rag/query     → retrieval + LLM answer (Streamlit on EC2 #2 with
+                        OLLAMA_HOST pointing to EC2 #3 private IP or local fallback)
+
+This avoids the EC2 #3 → EC2 #2 → EC2 #3 round-trip for LLM calls.
+The GPU on EC2 #3 is used directly by OpenWebUI; EC2 #2 only does retrieval.
 
 Endpoints:
-  POST /v1/rag/query      — ask a question, get RAG answer + source docs
+  POST /v1/rag/retrieve   — LanceDB search only → context docs + augmented messages
+                            (NO LLM call — caller handles generation)
+  POST /v1/rag/query      — full RAG: retrieval + Ollama answer
+                            (used by Streamlit on EC2 #2)
   POST /v1/rag/ingest     — upload + ingest a document into LanceDB
   GET  /v1/rag/documents  — list all ingested documents
   DELETE /v1/rag/documents/{filename} — remove a document
   GET  /health            — health check (LanceDB + Ollama reachability)
 
-OpenWebUI compatible:
-  The /v1/rag/query response includes an 'openai_messages' field so the
-  OpenWebUI pipeline can pass the augmented context directly to the LLM.
-
-Run standalone:
+Run standalone (on EC2 #2):
   uvicorn agents.rag_api:app --host 0.0.0.0 --port 8100 --reload
 
-Environment variables:
+Environment variables (EC2 #2):
   LANCEDB_URI          LanceDB path (local or s3://)   default: s3://codepais3/lancedb_data/
-  OLLAMA_HOST          Ollama base URL                  default: http://localhost:11434
+  OLLAMA_HOST          EC2 #3 private IP when up        e.g. http://10.0.1.50:11434
+                       Falls back to local Ollama if EC2 #3 is down
+  OLLAMA_FALLBACK_HOST Local Ollama on EC2 #2 (smaller model fallback)
+                                                        default: http://localhost:11434
   RAG_LLM_MODEL        Default Ollama model             default: llama3.2
+  RAG_FALLBACK_MODEL   Smaller model on EC2 #2          default: llama3.2
   RAG_TOP_K            Documents to retrieve            default: 5
   RAG_MAX_CTX_CHARS    Max context chars sent to LLM    default: 6000
   RAG_API_KEY          Optional bearer token for API    default: (none)
@@ -44,10 +59,12 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-_RAG_API_KEY  = os.getenv("RAG_API_KEY", "")          # empty = no auth
-_TOP_K        = int(os.getenv("RAG_TOP_K", "5"))
-_MAX_CTX      = int(os.getenv("RAG_MAX_CTX_CHARS", "6000"))
-_DEFAULT_MODEL = os.getenv("RAG_LLM_MODEL", "llama3.2")
+_RAG_API_KEY     = os.getenv("RAG_API_KEY", "")          # empty = no auth
+_TOP_K           = int(os.getenv("RAG_TOP_K", "5"))
+_MAX_CTX         = int(os.getenv("RAG_MAX_CTX_CHARS", "6000"))
+_DEFAULT_MODEL   = os.getenv("RAG_LLM_MODEL", "llama3.2")
+_FALLBACK_MODEL  = os.getenv("RAG_FALLBACK_MODEL", "llama3.2")  # smaller model on EC2 #2
+_OLLAMA_FALLBACK = os.getenv("OLLAMA_FALLBACK_HOST", "http://localhost:11434")
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -98,6 +115,21 @@ class QueryResponse(BaseModel):
     context_used: str             # raw context string sent to LLM
     openai_messages: List[dict]   # ready-to-use for OpenWebUI pipeline / OpenAI SDK
 
+
+class RetrieveRequest(BaseModel):
+    question: str
+    collections: Optional[List[str]] = None
+    k: int = _TOP_K
+    max_ctx_chars: int = _MAX_CTX
+    chat_history: Optional[List[ChatMessage]] = None   # previous turns for context
+
+
+class RetrieveResponse(BaseModel):
+    sources: List[dict]           # [{filename, collection, source_uri, score}]
+    context_used: str             # raw context string
+    openai_messages: List[dict]   # augmented messages ready to forward to any LLM
+                                  # caller does generation — EC2 #3 GPU handles it
+
 class IngestResponse(BaseModel):
     status: str
     filename: str
@@ -141,7 +173,10 @@ def _answer_with_history(
     from agents.knowledge_query_agent import search_lancedb, build_context_from_results
 
     resolved_model = model or _DEFAULT_MODEL
-    ollama_host = os.getenv("OLLAMA_HOST", os.getenv("STREAMLIT_OLLAMA_HOST", "http://localhost:11434"))
+    # Primary: OLLAMA_HOST (EC2 #3 private IP when set, else localhost)
+    primary_host   = os.getenv("OLLAMA_HOST", os.getenv("STREAMLIT_OLLAMA_HOST", "http://localhost:11434"))
+    # Fallback: local Ollama on EC2 #2 (smaller model, may run even when EC2 #3 is down)
+    fallback_host  = _OLLAMA_FALLBACK
 
     # 1) Retrieve from LanceDB
     df = search_lancedb(question, collections=collections, k=k)
@@ -186,14 +221,35 @@ def _answer_with_history(
     )
     messages.append({"role": "user", "content": augmented_user})
 
-    # 4) Call Ollama
-    resp = _requests.post(
-        f"{ollama_host}/api/chat",
-        json={"model": resolved_model, "messages": messages, "stream": False},
-        timeout=300,
-    )
-    resp.raise_for_status()
-    answer = resp.json().get("message", {}).get("content", "No answer returned.")
+    # 4) Call Ollama — try primary (EC2 #3), fall back to local (EC2 #2)
+    def _call_ollama(host: str, mdl: str) -> str:
+        r = _requests.post(
+            f"{host}/api/chat",
+            json={"model": mdl, "messages": messages, "stream": False},
+            timeout=300,
+        )
+        r.raise_for_status()
+        return r.json().get("message", {}).get("content", "No answer returned.")
+
+    try:
+        answer = _call_ollama(primary_host, resolved_model)
+    except Exception as primary_exc:
+        logger.warning(
+            "Primary Ollama at %s failed (%s) — trying fallback at %s",
+            primary_host, primary_exc, fallback_host,
+        )
+        # Only fall back if the fallback is a different host
+        if fallback_host and fallback_host != primary_host:
+            try:
+                answer = _call_ollama(fallback_host, _FALLBACK_MODEL)
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Both Ollama hosts failed.\n"
+                    f"  Primary  ({primary_host}): {primary_exc}\n"
+                    f"  Fallback ({fallback_host}): {fallback_exc}"
+                ) from fallback_exc
+        else:
+            raise
 
     # 5) Build openai_messages (for OpenWebUI pipeline — passes clean context to next step)
     openai_messages = [system_msg] + (
@@ -212,6 +268,80 @@ def _answer_with_history(
 # ═══════════════════════════════════════════════════════════════════════════════
 # Endpoints
 # ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/v1/rag/retrieve", response_model=RetrieveResponse, dependencies=[Depends(_check_api_key)])
+def rag_retrieve(req: RetrieveRequest) -> RetrieveResponse:
+    """
+    LanceDB retrieval only — NO LLM call.
+
+    Use this endpoint when the caller (e.g. OpenWebUI running on EC2 #3)
+    wants to handle generation itself on its local GPU.
+
+    Flow:
+      1. Embed the question
+      2. Search LanceDB for top-k relevant documents
+      3. Build RAG context string
+      4. Return context + sources + OpenAI-compatible augmented messages
+
+    The returned `openai_messages` list is ready to pass directly to any
+    OpenAI-compatible LLM API (Ollama /api/chat, OpenAI, etc.).
+    This avoids the EC2 #3 → EC2 #2 → EC2 #3 round-trip for LLM calls.
+    """
+    from agents.knowledge_query_agent import search_lancedb, build_context_from_results
+
+    try:
+        # 1) Retrieve from LanceDB
+        df = search_lancedb(req.question, collections=req.collections, k=req.k)
+        context = build_context_from_results(df, max_chars=req.max_ctx_chars)
+
+        # 2) Build sources metadata
+        sources: List[dict] = []
+        if not df.empty:
+            for _, row in df.iterrows():
+                sources.append({
+                    "filename":   str(row.get("filename", "")),
+                    "collection": str(row.get("collection", "")),
+                    "source_uri": str(row.get("source_uri", "")),
+                    "score": float(row.get("_distance", row.get("score", 0.0))),
+                })
+
+        # 3) Build system prompt
+        system_msg = {
+            "role": "system",
+            "content": (
+                "You are a helpful data and documentation assistant for DataPAI. "
+                "Use ONLY the provided context to answer. "
+                "If the answer is not in the context, say you don't know. "
+                "Do NOT invent facts. Be concise and precise."
+            ),
+        }
+
+        # 4) Build augmented messages (system + history + RAG-injected user question)
+        messages: List[dict] = [system_msg]
+
+        if req.chat_history:
+            for turn in req.chat_history:
+                messages.append({"role": turn.role, "content": turn.content})
+
+        augmented_user = (
+            f"Context from knowledge base:\n"
+            f"{'─' * 60}\n"
+            f"{context}\n"
+            f"{'─' * 60}\n\n"
+            f"Question: {req.question}"
+        )
+        messages.append({"role": "user", "content": augmented_user})
+
+        return RetrieveResponse(
+            sources=sources,
+            context_used=context,
+            openai_messages=messages,
+        )
+
+    except Exception as exc:
+        logger.exception("RAG retrieve failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 @app.post("/v1/rag/query", response_model=QueryResponse, dependencies=[Depends(_check_api_key)])
 def rag_query(req: QueryRequest) -> QueryResponse:
