@@ -15,8 +15,52 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional, List
 
-from agent_base import BaseAgent
-from llm_client import BaseChatClient, RouterChatClient
+from .agent_base import BaseAgent
+from .llm_client import BaseChatClient, RouterChatClient
+from etl.plans import WorkflowPlan
+
+PLAN_SYSTEM_PROMPT = """
+You are a data engineering supervisor agent.
+Return ONLY valid JSON matching this schema:
+
+{
+  "workflow": "ingest_to_dbt",
+  "source_type": "...",
+  "source": "...",
+  "target": "...",
+  "target_schema": "...",
+  "target_table": "...",
+  "mode": "upsert|overwrite",
+  "pk": ["col1","col2"] | null,
+  "tests": [{"type":"not_null","column":"..."}, {"type":"unique","column":"..."}],
+  "notes": "..."
+}
+
+Rules:
+- Prefer snake_case for target_table.
+- If pk unknown, set pk=null and propose tests using best guess.
+- Keep it deterministic: do not invent source paths.
+"""
+
+class SupervisorAgent:
+    def __init__(self, llm_client):
+        self.llm = llm_client
+
+    def plan(self, user_request: Dict[str, Any]) -> WorkflowPlan:
+        # user_request should include source/target fields from UI
+        prompt = {
+            "role": "user",
+            "content": f"Create a workflow plan for this request:\n{json.dumps(user_request, indent=2)}"
+        }
+        resp = self.llm.chat(messages=[
+            {"role": "system", "content": PLAN_SYSTEM_PROMPT},
+            prompt
+        ])
+
+        # resp should be JSON string
+        plan_dict = json.loads(resp)
+        return WorkflowPlan(**plan_dict)
+
 
 
 # ------------------------------
@@ -65,30 +109,30 @@ You are NOT performing SQL/ETL logic yourself — you delegate to:
 # SUPERVISOR AGENT CLASS
 # ------------------------------
 
-class SupervisorAgent(BaseAgent):
-    """
-    High-level orchestrator agent.
+# class SupervisorAgent_old(BaseAgent):
+#     """
+#     High-level orchestrator agent.
 
-    Chooses which agent to run, based on the goal.
-    """
+#     Chooses which agent to run, based on the goal.
+#     """
 
-    def __init__(
-        self,
-        llm: Optional[BaseChatClient] = None,
-        max_steps: int = 12,
-        temperature: float = 0.10,
-    ):
-        # Default to using your unified GPT-5.1 + Gemini reviewer router
-        if llm is None:
-            llm = RouterChatClient()
+#     def __init__(
+#         self,
+#         llm: Optional[BaseChatClient] = None,
+#         max_steps: int = 12,
+#         temperature: float = 0.10,
+#     ):
+#         # Default to using your unified GPT-5.1 + Gemini reviewer router
+#         if llm is None:
+#             llm = RouterChatClient()
 
-        super().__init__(
-            name="supervisor_agent",
-            llm=llm,
-            system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-            max_steps=max_steps,
-            temperature=temperature,
-        )
+#         super().__init__(
+#             name="supervisor_agent",
+#             llm=llm,
+#             system_prompt=SUPERVISOR_SYSTEM_PROMPT,
+#             max_steps=max_steps,
+#             temperature=temperature,
+#         )
 
-    # (Most of the logic lives in BaseAgent.run(), so SupervisorAgent is simple.)
+#     # (Most of the logic lives in BaseAgent.run(), so SupervisorAgent is simple.)
 

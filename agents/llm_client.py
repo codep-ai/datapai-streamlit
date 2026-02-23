@@ -359,6 +359,8 @@ class RouterChatClient(BaseChatClient):
     """
 
     def __init__(self):
+        self.llm_enabled = os.environ.get("DATAPAI_LLM_ENABLED", "true").lower() == "true"
+
         mode = os.environ.get("LLM_MODE", "paid").lower()
         if mode not in ("paid", "local", "hybrid"):
             mode = "paid"
@@ -500,6 +502,13 @@ class RouterChatClient(BaseChatClient):
         - If LLM_MODE="hybrid":
             -> try Ollama first, then fall back to cloud primary
         """
+        if not self.llm_enabled:
+            raise RuntimeError(
+                "LLM usage is disabled (DATAPAI_LLM_ENABLED=false). "
+                "Deterministic executor mode enforced."
+            )
+
+        
         if self.mode == "paid":
             draft = self._call_provider(self.primary_provider, messages, temperature, stream)
 

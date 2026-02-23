@@ -5,7 +5,7 @@ node_modules
 .streamlit
 vector_store
 # Python
-__pycache__/
+__pycache__
 *.pyc
 *.pyo
 *.pyd
