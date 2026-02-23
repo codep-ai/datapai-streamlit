@@ -3,9 +3,11 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from llm_client import BaseChatClient  # NOTE: we no longer import RouterChatClient here
+from .llm_client import BaseChatClient  # NOTE: we no longer import RouterChatClient here
 #from tools import list_tools, call_tool_from_json_call
-import tools
+#import tools
+from .tooling.loader import load_all_tools
+from .tooling.registry import list_tools, call_tool_from_json_call
 
 
 # BUGFIX: Robust JSON parsing for LLM outputs (handles code fences + NDJSON)
@@ -133,7 +135,7 @@ class BaseAgent:
                 "reason": "BaseAgent.llm is None. You must pass an LLM (e.g. RouterChatClient) when creating the agent.",
                 "history": [],
             }
-
+        load_all_tools()   # idempotent; you can guard it with a global flag
         context = context or {}
         history: List[Dict[str, Any]] = []
         step = 0

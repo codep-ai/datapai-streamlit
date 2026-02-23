@@ -27,7 +27,7 @@ st.title("DataPAI(DATA + AI) - Enterprise Data with AI ")
 st.title("Generate SQL for these databases by AI ")
 
 # Adding checkboxes for database options
-db_options = ["Snowflake", "Redshift", "SQLite3","Bigquery", "DuckDB"]
+db_options = ["Snowflake", "Redshift","Athena", "SQLite3","Bigquery", "DuckDB"]
 default_db_index = db_options.index("SQLite3")  # Set SQLite3 as the default
 
 # Initialize the global variable for selected database
@@ -136,6 +136,9 @@ if my_question:
 
         df = run_sql_cached(sql=sql)
 
+        if selected_db == "Athena":
+            st.info("Using Amazon Athena on S3. Iceberg, Parquet, and CSV tables are supported.")
+ 
         # 🔵 Run SQL in Lightdash if Snowflake is selected
         lightdash_response = None
         if selected_db in ["Snowflake","Redshift","Bigquery"] :

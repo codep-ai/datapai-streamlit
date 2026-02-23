@@ -118,5 +118,7 @@ def get_dbt_metadata(query, top_k=3):
 
 
 # Ensure FAISS is up to date when this script runs
-update_dbt_metadata()
+if __name__ == "__main__":
+    update_dbt_metadata()
+    
 
