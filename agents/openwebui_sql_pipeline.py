@@ -68,11 +68,12 @@ class Pipeline:
     """
 
     class Valves(BaseModel):
-        DATAPAI_SQL_API_URL:    str  = os.getenv("DATAPAI_SQL_API_URL",    "http://localhost:8101")
-        DATAPAI_SQL_API_KEY:    str  = os.getenv("DATAPAI_SQL_API_KEY",    "")
-        DATAPAI_SQL_DEFAULT_DB: str  = os.getenv("DATAPAI_SQL_DEFAULT_DB", "Snowflake")
-        DATAPAI_SQL_RUN_SQL:    bool = os.getenv("DATAPAI_SQL_RUN_SQL", "true").lower() != "false"
-        DATAPAI_SQL_MAX_ROWS:   int  = int(os.getenv("DATAPAI_SQL_MAX_ROWS", "50"))
+        DATAPAI_SQL_API_URL:      str  = os.getenv("DATAPAI_SQL_API_URL",      "http://localhost:8101")
+        DATAPAI_SQL_API_KEY:      str  = os.getenv("DATAPAI_SQL_API_KEY",      "")
+        DATAPAI_SQL_DEFAULT_DB:   str  = os.getenv("DATAPAI_SQL_DEFAULT_DB",   "Snowflake")
+        DATAPAI_SQL_RUN_SQL:      bool = os.getenv("DATAPAI_SQL_RUN_SQL",      "true").lower() != "false"
+        DATAPAI_SQL_MAX_ROWS:     int  = int(os.getenv("DATAPAI_SQL_MAX_ROWS", "50"))
+        DATAPAI_SQL_GENERATE_DBT: bool = os.getenv("DATAPAI_SQL_GENERATE_DBT", "false").lower() == "true"
 
     def __init__(self):
         self.name   = "DataPAI Text2SQL"
@@ -146,14 +147,15 @@ class Pipeline:
         """Build the full markdown answer from the API response."""
         lines: List[str] = []
 
-        sql    = resp_data.get("sql", "")
-        db     = resp_data.get("db", "")
-        rows   = resp_data.get("rows") or []
-        count  = resp_data.get("row_count")
-        summ   = resp_data.get("summary", "")
-        follows = resp_data.get("followup_questions") or []
-        err    = resp_data.get("error")
-        valid  = resp_data.get("is_valid", True)
+        sql      = resp_data.get("sql", "")
+        db       = resp_data.get("db", "")
+        rows     = resp_data.get("rows") or []
+        count    = resp_data.get("row_count")
+        summ     = resp_data.get("summary", "")
+        follows  = resp_data.get("followup_questions") or []
+        dbt_code = resp_data.get("dbt_code")
+        err      = resp_data.get("error")
+        valid    = resp_data.get("is_valid", True)
 
         # ── SQL block ──────────────────────────────────────────────────
         if sql:
@@ -187,6 +189,10 @@ class Pipeline:
             for q in follows[:4]:
                 lines.append(f"- {q}")
 
+        # ── dbt model code ─────────────────────────────────────────────
+        if dbt_code:
+            lines.append(f"\n**dbt model:**\n```sql\n{dbt_code}\n```")
+
         return "\n".join(lines)
 
     # ── Main entrypoint ────────────────────────────────────────────────────
@@ -217,7 +223,7 @@ class Pipeline:
             "db":             db,
             "run_sql":        self.valves.DATAPAI_SQL_RUN_SQL,
             "generate_chart": False,
-            "generate_dbt":   False,
+            "generate_dbt":   self.valves.DATAPAI_SQL_GENERATE_DBT,
         }
 
         try:

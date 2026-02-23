@@ -86,9 +86,10 @@ class Pipeline:
         DATAPAI_RAG_MODEL:      str  = os.getenv("DATAPAI_RAG_MODEL",       "llama3.2")
 
         # SQL
-        DATAPAI_SQL_DEFAULT_DB: str  = os.getenv("DATAPAI_SQL_DEFAULT_DB",  "Snowflake")
-        DATAPAI_SQL_RUN_SQL:    bool = os.getenv("DATAPAI_SQL_RUN_SQL",     "true").lower() != "false"
-        DATAPAI_SQL_MAX_ROWS:   int  = int(os.getenv("DATAPAI_SQL_MAX_ROWS", "50"))
+        DATAPAI_SQL_DEFAULT_DB:   str  = os.getenv("DATAPAI_SQL_DEFAULT_DB",   "Snowflake")
+        DATAPAI_SQL_RUN_SQL:      bool = os.getenv("DATAPAI_SQL_RUN_SQL",       "true").lower() != "false"
+        DATAPAI_SQL_MAX_ROWS:     int  = int(os.getenv("DATAPAI_SQL_MAX_ROWS",  "50"))
+        DATAPAI_SQL_GENERATE_DBT: bool = os.getenv("DATAPAI_SQL_GENERATE_DBT",  "false").lower() == "true"
 
         # RAG
         DATAPAI_RAG_TOP_K:      int  = int(os.getenv("DATAPAI_RAG_TOP_K",   "5"))
@@ -247,7 +248,7 @@ class Pipeline:
                     "db":             db,
                     "run_sql":        self.valves.DATAPAI_SQL_RUN_SQL,
                     "generate_chart": False,
-                    "generate_dbt":   False,
+                    "generate_dbt":   self.valves.DATAPAI_SQL_GENERATE_DBT,
                 },
                 headers=self._sql_headers(),
                 timeout=120,
@@ -267,14 +268,15 @@ class Pipeline:
 
     def _format_sql_answer(self, data: dict) -> str:
         lines: List[str] = []
-        sql    = data.get("sql", "")
-        db     = data.get("db", "")
-        rows   = data.get("rows") or []
-        count  = data.get("row_count")
-        summ   = data.get("summary", "")
-        follows = data.get("followup_questions") or []
-        err    = data.get("error")
-        valid  = data.get("is_valid", True)
+        sql      = data.get("sql", "")
+        db       = data.get("db", "")
+        rows     = data.get("rows") or []
+        count    = data.get("row_count")
+        summ     = data.get("summary", "")
+        follows  = data.get("followup_questions") or []
+        dbt_code = data.get("dbt_code")
+        err      = data.get("error")
+        valid    = data.get("is_valid", True)
 
         if sql:
             lines.append(f"```sql\n-- Target: {db}\n{sql}\n```")
@@ -295,6 +297,8 @@ class Pipeline:
             lines.append("\n**Suggested follow-up questions:**")
             for q in follows[:4]:
                 lines.append(f"- {q}")
+        if dbt_code:
+            lines.append(f"\n**dbt model:**\n```sql\n{dbt_code}\n```")
         return "\n".join(lines)
 
     def _markdown_table(self, rows: List[dict], max_rows: int) -> str:

@@ -26,6 +26,11 @@ Environment variables:
   ATHENA_DATABASE / _DATABASES (comma-separated) / _S3_STAGING_DIR / _WORKGROUP
   BIGQUERY_PROJECT / _DATASET  (uses ADC / instance service account)
   AWS_REGION               for Athena + Glue     default: us-east-1
+
+  dbt:
+  DBT_ENABLED              Inject dbt metadata context before SQL gen  default: true
+  DBT_PROJECT_DIR          dbt project root (for manifest.json)        default: dbt-demo
+  DBT_METADATA_TOP_K       Top-k dbt models to inject as context       default: 3
 """
 
 from __future__ import annotations
@@ -45,6 +50,8 @@ _VANNA_KEY    = os.getenv("VANNA_API_KEY", "")
 _VANNA_MODEL  = os.getenv("VANNA_MODEL", "chinook")
 _DEFAULT_DB   = os.getenv("SQL_DEFAULT_DB", "Snowflake")
 _MAX_ROWS     = int(os.getenv("SQL_MAX_ROWS", "100"))
+_DBT_ENABLED  = os.getenv("DBT_ENABLED", "true").lower() != "false"
+_DBT_TOP_K    = int(os.getenv("DBT_METADATA_TOP_K", "3"))
 
 SUPPORTED_DBS = [
     "Snowflake", "Redshift", "Athena", "DuckDB", "SQLite3", "BigQuery", "dbt"
@@ -255,6 +262,7 @@ class SqlQueryResponse(BaseModel):
     row_count:          Optional[int]                  = None
     summary:            Optional[str]                  = None
     followup_questions: Optional[List[str]]            = None
+    dbt_code:           Optional[str]                  = None   # dbt model SQL
     error:              Optional[str]                  = None
     is_valid:           bool                           = True
 
@@ -295,9 +303,22 @@ def sql_query(req: SqlQueryRequest) -> SqlQueryResponse:
     except Exception as exc:
         return SqlQueryResponse(sql="", db=db, error=f"Vanna init failed: {exc}", is_valid=False)
 
+    # ── dbt metadata context (FAISS) ──────────────────────────────────────────
+    dbt_context = ""
+    if _DBT_ENABLED:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+            from dbt_metadata import get_dbt_metadata   # type: ignore
+            meta = get_dbt_metadata(req.question, top_k=_DBT_TOP_K)
+            if meta and meta != "No relevant metadata found.":
+                dbt_context = f"\n\nRelevant dbt models:\n{meta}"
+        except Exception:
+            pass   # dbt metadata unavailable — continue without it
+
     # ── Generate SQL ──────────────────────────────────────────────────────────
     assumption    = _build_assumption(db)
-    question_full = req.question + assumption
+    question_full = req.question + assumption + dbt_context
 
     try:
         sql = vn.generate_sql(question=question_full, allow_llm_to_see_data=True)
@@ -346,6 +367,16 @@ def sql_query(req: SqlQueryRequest) -> SqlQueryResponse:
         except Exception:
             pass
 
+    # ── dbt code generation (optional) ───────────────────────────────────────
+    dbt_code: Optional[str] = None
+    if req.generate_dbt and sql:
+        try:
+            import pandas as pd
+            df_d     = pd.DataFrame(rows) if rows else pd.DataFrame()
+            dbt_code = vn.generate_dbt_code(question=req.question, sql=sql, df=df_d)
+        except Exception:
+            pass
+
     return SqlQueryResponse(
         sql=sql,
         db=db,
@@ -353,6 +384,7 @@ def sql_query(req: SqlQueryRequest) -> SqlQueryResponse:
         row_count=row_count,
         summary=summary,
         followup_questions=followup_questions,
+        dbt_code=dbt_code,
         error=error,
         is_valid=is_valid,
     )
