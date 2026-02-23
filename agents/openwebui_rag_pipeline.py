@@ -67,8 +67,9 @@ ENVIRONMENT VARIABLES (set in OpenWebUI Pipeline settings)
 
 from __future__ import annotations
 
+import json
 import os
-from typing import AsyncGenerator, Iterator, List, Union
+from typing import Generator, Iterator, List, Union
 
 import requests
 
@@ -103,6 +104,8 @@ class Pipeline:
         DATAPAI_RAG_FALLBACK: bool = os.getenv("DATAPAI_RAG_FALLBACK", "true").lower() != "false"
         # Where to send generation requests — set to EC2 #3 private IP if available
         OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        # Stream tokens back to OpenWebUI as they are generated
+        DATAPAI_RAG_STREAM: bool = os.getenv("DATAPAI_RAG_STREAM", "true").lower() != "false"
 
     def __init__(self):
         self.name   = "DataPAI RAG (LanceDB)"
@@ -156,7 +159,7 @@ class Pipeline:
         model_id: str,
         messages: List[dict],
         body: dict,
-    ) -> Union[str, Iterator[str], AsyncGenerator[str, None]]:
+    ) -> Union[str, Generator[str, None, None]]:
         """
         Called for every chat message sent to this pipeline in OpenWebUI.
 
@@ -222,34 +225,7 @@ class Pipeline:
 
         # ── Step 2: Generate answer via Ollama at OLLAMA_HOST ─────────────
 
-        try:
-            gen_resp = requests.post(
-                f"{self.valves.OLLAMA_HOST}/api/chat",
-                json={
-                    "model":    self.valves.DATAPAI_RAG_MODEL,
-                    "messages": openai_messages,
-                    "stream":   False,
-                },
-                timeout=300,
-            )
-            gen_resp.raise_for_status()
-            answer = gen_resp.json().get("message", {}).get("content", "No answer returned.")
-
-        except Exception as exc:
-            # Ollama unreachable — return context only so user can see what was found
-            no_llm_msg = (
-                f"⚠️ Ollama not reachable at `{self.valves.OLLAMA_HOST}` — "
-                f"returning retrieved context only.\n\n"
-                f"**Error:** `{exc}`\n\n"
-            )
-            if sources:
-                no_llm_msg += "**Retrieved documents:**\n"
-                for src in sources:
-                    no_llm_msg += f"- **{src.get('filename','?')}** [{src.get('collection','?')}]\n"
-            return no_llm_msg
-
-        # ── Append source citations ────────────────────────────────────────
-
+        citations = ""
         if sources:
             citation_lines = ["\n\n---\n📎 **Sources from knowledge base:**"]
             for src in sources:
@@ -257,9 +233,86 @@ class Pipeline:
                 coll = src.get("collection", "?")
                 uri  = src.get("source_uri", "")
                 citation_lines.append(f"- **{name}** [{coll}]  `{uri}`")
-            answer += "\n".join(citation_lines)
+            citations = "\n".join(citation_lines)
 
-        return answer
+        if self.valves.DATAPAI_RAG_STREAM:
+            return self._stream_ollama(openai_messages, citations)
+        else:
+            return self._generate_ollama(openai_messages, citations, sources)
+
+    def _stream_ollama(
+        self,
+        messages: List[dict],
+        citations: str,
+    ) -> Generator[str, None, None]:
+        """
+        Stream tokens from Ollama, then append source citations at the end.
+        OpenWebUI consumes the generator and displays tokens as they arrive.
+        """
+        try:
+            with requests.post(
+                f"{self.valves.OLLAMA_HOST}/api/chat",
+                json={
+                    "model":    self.valves.DATAPAI_RAG_MODEL,
+                    "messages": messages,
+                    "stream":   True,
+                },
+                stream=True,
+                timeout=300,
+            ) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    try:
+                        chunk = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+                    if chunk.get("done"):
+                        break
+        except Exception as exc:
+            yield (
+                f"\n\n⚠️ Ollama not reachable at `{self.valves.OLLAMA_HOST}` — "
+                f"returned retrieved context only.\n**Error:** `{exc}`"
+            )
+
+        if citations:
+            yield citations
+
+    def _generate_ollama(
+        self,
+        messages: List[dict],
+        citations: str,
+        sources: List[dict],
+    ) -> str:
+        """Non-streaming Ollama call (DATAPAI_RAG_STREAM=false)."""
+        try:
+            gen_resp = requests.post(
+                f"{self.valves.OLLAMA_HOST}/api/chat",
+                json={
+                    "model":    self.valves.DATAPAI_RAG_MODEL,
+                    "messages": messages,
+                    "stream":   False,
+                },
+                timeout=300,
+            )
+            gen_resp.raise_for_status()
+            answer = gen_resp.json().get("message", {}).get("content", "No answer returned.")
+            return answer + citations
+
+        except Exception as exc:
+            no_llm_msg = (
+                f"⚠️ Ollama not reachable at `{self.valves.OLLAMA_HOST}` — "
+                f"returning retrieved context only.\n\n**Error:** `{exc}`\n\n"
+            )
+            if sources:
+                no_llm_msg += "**Retrieved documents:**\n"
+                for src in sources:
+                    no_llm_msg += f"- **{src.get('filename','?')}** [{src.get('collection','?')}]\n"
+            return no_llm_msg
 
     # ── Fallback: plain Ollama (no RAG) ───────────────────────────────────
 
