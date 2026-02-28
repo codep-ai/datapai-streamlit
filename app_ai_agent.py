@@ -90,7 +90,7 @@ def run_ai_agents():
         "DLT Ingest",
         "Airbyte Sync",
         "Workflow (Ingest → dbt)",
-        "ASX Announcements",
+        "📢 Market Announcements",
         "📊 Technical Analysis",
     ])
 
@@ -466,45 +466,77 @@ def run_ai_agents():
             except Exception as e:
                 st.error(f"Workflow failed: {e}")
 
-    # ── Tab 8: ASX Market Announcements ────────────────────────────────────────
+    # ── Tab 8: Market Announcements (ASX + US SEC EDGAR) ──────────────────────
     with tab8:
-        st.header("📈 ASX Market Announcements")
-        st.caption(
-            "Fetch and interpret ASX announcements in real-time — no manual PDF upload needed. "
-            "Use **Quick Interpret** for instant LLM analysis, or **Ingest** to add to the knowledge base for RAG."
-        )
+        st.header("📢 Market Announcements")
 
-        # ── Session state init ──────────────────────────────────────────────
+        # ── Market selector ─────────────────────────────────────────────────
+        market_choice = st.radio(
+            "Select market",
+            ["🇦🇺 ASX (Australian Securities Exchange)",
+             "🇺🇸 US (SEC EDGAR — NYSE / NASDAQ)"],
+            horizontal=True,
+            key="market_choice",
+        )
+        _is_us = market_choice.startswith("🇺🇸")
+
+        # ── Session state init — ASX ────────────────────────────────────────
         for _key, _default in {
             "asx_announcements":  [],
-            "asx_pdf_cache":      {},   # {url: pdf_text}
+            "asx_pdf_cache":      {},
             "asx_interpretation": "",
             "asx_selected_idx":   0,
             "asx_chat_history":   [],
-            "asx_signal":         "",   # latest trading signal markdown
-            "asx_signal_idx":     0,    # which announcement the signal is for
+            "asx_signal":         "",
+            "asx_signal_idx":     0,
         }.items():
             if _key not in st.session_state:
                 st.session_state[_key] = _default
 
-        # ── Controls ────────────────────────────────────────────────────────
-        ctrl_col, _ = st.columns([2, 1])
-        with ctrl_col:
-            tickers_input = st.text_input(
-                "ASX Ticker(s)",
-                placeholder="e.g.  BHP, CBA, RIO",
-                help="Enter one or more ASX ticker symbols separated by commas.",
-                key="asx_ticker_input",
-            )
-            ann_count = st.slider(
-                "Number of announcements per ticker", 5, 50, 20, key="asx_count"
-            )
-            ms_only = st.checkbox(
-                "Market-sensitive only", key="asx_ms_only",
-                help="Tick to return only announcements flagged as market-sensitive."
+        # ── Session state init — US ─────────────────────────────────────────
+        for _key, _default in {
+            "us_filings":         [],
+            "us_text_cache":      {},   # {url: text}
+            "us_interpretation":  "",
+            "us_selected_idx":    0,
+            "us_chat_history":    [],
+            "us_signal":          "",
+            "us_signal_idx":      0,
+        }.items():
+            if _key not in st.session_state:
+                st.session_state[_key] = _default
+
+        st.divider()
+
+        # ════════════════════════════════════════════════════════════════════
+        # ASX PATH
+        # ════════════════════════════════════════════════════════════════════
+        if not _is_us:
+            st.subheader("📈 ASX Market Announcements")
+            st.caption(
+                "Fetch and interpret ASX announcements in real-time — no manual PDF upload needed. "
+                "Use **Quick Interpret** for instant LLM analysis, or **Ingest** to add to the knowledge base for RAG."
             )
 
-        fetch_btn = st.button("🔍 Fetch Announcements", key="asx_fetch")
+        # ── ASX Controls ────────────────────────────────────────────────────
+        if not _is_us:
+            ctrl_col, _ = st.columns([2, 1])
+            with ctrl_col:
+                tickers_input = st.text_input(
+                    "ASX Ticker(s)",
+                    placeholder="e.g.  BHP, CBA, RIO",
+                    help="Enter one or more ASX ticker symbols separated by commas.",
+                    key="asx_ticker_input",
+                )
+                ann_count = st.slider(
+                    "Number of announcements per ticker", 5, 50, 20, key="asx_count"
+                )
+                ms_only = st.checkbox(
+                    "Market-sensitive only", key="asx_ms_only",
+                    help="Tick to return only announcements flagged as market-sensitive."
+                )
+
+            fetch_btn = st.button("🔍 Fetch Announcements", key="asx_fetch")
 
         if fetch_btn and tickers_input.strip():
             
@@ -769,6 +801,256 @@ def run_ai_agents():
                     st.session_state.asx_chat_history.append(
                         {"role": "assistant", "content": answer}
                     )
+
+        # ════════════════════════════════════════════════════════════════════
+        # US PATH — SEC EDGAR
+        # ════════════════════════════════════════════════════════════════════
+        if _is_us:
+            st.subheader("🇺🇸 US SEC EDGAR Filings")
+            st.caption(
+                "Fetch and interpret SEC filings (8-K, 10-Q, 10-K) for NYSE / NASDAQ stocks. "
+                "Uses the free SEC EDGAR API — no API key needed. "
+                "Set **SEC_CONTACT_EMAIL** env var to comply with SEC User-Agent policy."
+            )
+            st.error(
+                "⚠️ **NOT FINANCIAL ADVICE** — AI-generated analysis for informational "
+                "and educational purposes only.",
+                icon="⚠️",
+            )
+
+            # ── US Controls ─────────────────────────────────────────────────
+            us_col1, us_col2, us_col3 = st.columns([2, 2, 1])
+            with us_col1:
+                us_ticker = st.text_input(
+                    "US Ticker",
+                    placeholder="e.g. AAPL, NVDA, MSFT",
+                    key="us_ticker_input",
+                    help="NYSE / NASDAQ ticker symbol (no suffix needed).",
+                ).strip().upper()
+
+            with us_col2:
+                us_form_types = st.multiselect(
+                    "Form types",
+                    options=["8-K", "10-Q", "10-K", "DEF 14A", "S-1"],
+                    default=["8-K", "10-Q", "10-K"],
+                    key="us_form_types",
+                )
+
+            with us_col3:
+                us_count = st.number_input(
+                    "Max filings", min_value=5, max_value=50, value=20, key="us_count"
+                )
+
+            us_fetch_btn = st.button("🔍 Fetch Filings", key="us_fetch")
+
+            if us_fetch_btn and us_ticker:
+                from agents.sec_filing_agent import fetch_sec_filings as _us_fetch
+                with st.spinner(f"Fetching SEC filings for {us_ticker}…"):
+                    try:
+                        filings = _us_fetch(
+                            us_ticker,
+                            count=us_count,
+                            form_types=tuple(us_form_types or ["8-K", "10-Q", "10-K"]),
+                        )
+                        st.session_state.us_filings        = filings
+                        st.session_state.us_interpretation = ""
+                        st.session_state.us_chat_history   = []
+                        st.session_state.us_selected_idx   = 0
+                        st.session_state.us_signal         = ""
+                        if filings:
+                            st.success(f"✅ {len(filings)} filing(s) found for {us_ticker}")
+                        else:
+                            st.warning(
+                                f"No filings found for {us_ticker} with the selected form types. "
+                                "Try including 8-K or broadening form type selection."
+                            )
+                    except Exception as exc:
+                        st.error(f"❌ {exc}")
+
+            # ── Filings table ────────────────────────────────────────────────
+            if st.session_state.us_filings:
+                us_filings = st.session_state.us_filings
+
+                us_df = pd.DataFrame([{
+                    "Ticker":    f["ticker"],
+                    "Form":      f["form_type"],
+                    "Filed":     f["filed_date"],
+                    "Headline":  f["headline"],
+                    "Sensitive": "🔴" if f["market_sensitive"] else "",
+                } for f in us_filings])
+                st.dataframe(us_df, use_container_width=True, hide_index=True)
+
+                st.divider()
+
+                us_options = [
+                    f"{f['form_type']} | {f['filed_date']} | {f['headline'][:65]}"
+                    for f in us_filings
+                ]
+                us_label = st.selectbox(
+                    "Select filing to act on",
+                    us_options,
+                    index=min(st.session_state.us_selected_idx, len(us_options) - 1),
+                    key="us_select",
+                )
+                us_idx     = us_options.index(us_label)
+                us_filing  = us_filings[us_idx]
+
+                # ── Action buttons ───────────────────────────────────────────
+                us_a1, us_a2, us_a3 = st.columns(3)
+
+                with us_a1:
+                    if st.button("⚡ Interpret Filing", key="us_interpret_btn"):
+                        from agents.sec_filing_agent import (
+                            download_filing_text,
+                            interpret_filing,
+                        )
+                        us_url = us_filing.get("url", "")
+                        with st.spinner("Downloading filing and interpreting…"):
+                            try:
+                                if us_url not in st.session_state.us_text_cache:
+                                    text = download_filing_text(
+                                        us_filing["cik"],
+                                        us_filing["accession"],
+                                        us_filing["primary_doc"],
+                                    )
+                                    st.session_state.us_text_cache[us_url] = text
+                                else:
+                                    text = st.session_state.us_text_cache[us_url]
+
+                                interp = interpret_filing(us_filing, text, use_grounding=True)
+                                st.session_state.us_interpretation = interp
+                                st.session_state.us_chat_history   = []
+                                st.session_state.us_selected_idx   = us_idx
+                            except Exception as exc:
+                                st.error(f"❌ {exc}")
+
+                with us_a2:
+                    if st.button("🎯 Trading Signal", key="us_signal_btn",
+                                 help="AI signal: buy/sell/hold + price targets. NOT financial advice."):
+                        from agents.sec_filing_agent import (
+                            download_filing_text,
+                            generate_us_trading_signal,
+                        )
+                        from agents.technical_analysis import fetch_all_timeframes
+                        us_url = us_filing.get("url", "")
+                        with st.spinner("Fetching live price data + generating US trading signal… (~20–40 s)"):
+                            try:
+                                if us_url not in st.session_state.us_text_cache:
+                                    text = download_filing_text(
+                                        us_filing["cik"],
+                                        us_filing["accession"],
+                                        us_filing["primary_doc"],
+                                    )
+                                    st.session_state.us_text_cache[us_url] = text
+                                else:
+                                    text = st.session_state.us_text_cache[us_url]
+
+                                # US stocks: no suffix for NYSE/NASDAQ
+                                indicators_by_tf = fetch_all_timeframes(
+                                    us_filing["ticker"], suffix="", source="yahoo"
+                                )
+                                available = [tf for tf, v in indicators_by_tf.items() if v]
+                                if available:
+                                    st.info(f"📊 Price data loaded for: {', '.join(available)}")
+                                else:
+                                    st.warning(
+                                        "⚠️ Live price data unavailable — signal based on filing text only."
+                                    )
+
+                                signal_md = generate_us_trading_signal(
+                                    us_filing, text,
+                                    indicators_by_tf=indicators_by_tf,
+                                    ticker_suffix="",
+                                    use_grounding=True,
+                                )
+                                st.session_state.us_signal     = signal_md
+                                st.session_state.us_signal_idx = us_idx
+                            except Exception as exc:
+                                st.error(f"❌ Signal generation failed: {exc}")
+
+                with us_a3:
+                    st.link_button(
+                        "📄 View on SEC EDGAR",
+                        us_filing.get("url", "https://www.sec.gov/cgi-bin/browse-edgar"),
+                        help="Open the original filing on SEC.gov",
+                    )
+
+                # ── Trading signal display ───────────────────────────────────
+                if st.session_state.us_signal:
+                    sig_f = us_filings[st.session_state.us_signal_idx]
+                    st.divider()
+                    st.subheader(
+                        f"🎯 AI Trading Signal — {sig_f['ticker']} "
+                        f"({sig_f['form_type']} filed {sig_f['filed_date']})"
+                    )
+                    st.error(
+                        "⚠️ **NOT FINANCIAL ADVICE** — AI-generated signal for informational "
+                        "and educational purposes only. Always consult a licensed financial "
+                        "adviser before making any investment decision.",
+                        icon="⚠️",
+                    )
+                    st.markdown(st.session_state.us_signal)
+                    st.caption(
+                        f"Signal from: {sig_f['headline']}  |  "
+                        "LLM chain: Gemini (grounded) → GPT reviewer"
+                    )
+
+                # ── Interpretation display ───────────────────────────────────
+                if st.session_state.us_interpretation:
+                    st.divider()
+                    ref_f = us_filings[st.session_state.us_selected_idx]
+                    st.subheader(
+                        f"📋 {ref_f['ticker']} — {ref_f['form_type']} ({ref_f['filed_date']})"
+                    )
+                    st.markdown(st.session_state.us_interpretation)
+
+                    st.divider()
+                    st.subheader("💬 Ask Follow-up Questions")
+
+                    # Chat history
+                    for msg in st.session_state.us_chat_history:
+                        role_icon = "🧑" if msg["role"] == "user" else "🤖"
+                        st.markdown(f"**{role_icon}** {msg['content']}")
+
+                    with st.form("us_chat_form", clear_on_submit=True):
+                        us_question = st.text_input(
+                            "Your question",
+                            placeholder="e.g. What was revenue growth YoY? Any guidance changes?",
+                            key="us_question_input",
+                        )
+                        us_submit = st.form_submit_button("Ask")
+
+                    if us_submit and us_question.strip():
+                        from agents.sec_filing_agent import (
+                            download_filing_text,
+                            answer_filing_question,
+                        )
+                        us_url = ref_f.get("url", "")
+                        if us_url not in st.session_state.us_text_cache:
+                            filing_text = download_filing_text(
+                                ref_f["cik"], ref_f["accession"], ref_f["primary_doc"]
+                            )
+                            st.session_state.us_text_cache[us_url] = filing_text
+                        else:
+                            filing_text = st.session_state.us_text_cache[us_url]
+
+                        st.session_state.us_chat_history.append(
+                            {"role": "user", "content": us_question}
+                        )
+                        with st.spinner("Thinking…"):
+                            try:
+                                answer = answer_filing_question(
+                                    ref_f,
+                                    filing_text,
+                                    us_question,
+                                    chat_history=st.session_state.us_chat_history[:-1],
+                                )
+                            except Exception as exc:
+                                answer = f"⚠️ Error: {exc}"
+                        st.markdown(answer)
+                        st.session_state.us_chat_history.append(
+                            {"role": "assistant", "content": answer}
+                        )
 
     # ── Tab 9: Standalone Technical Analysis ────────────────────────────────────
     with tab9:
