@@ -185,23 +185,106 @@ class Pipeline:
         re.IGNORECASE,
     )
 
-    # ASX-intent keywords (heuristic fallback)
+    # ASX-intent keywords (heuristic fallback when Ollama classifier is down)
     _ASX_KEYWORDS = re.compile(
-        r"\b(asx|announce(d|ment)?|market.sensitive|price.sensitive"
+        r"\b(asx|announce(d|s|ment|ments)?|market.sensitive|price.sensitive"
         r"|quarterly.result|half.year(ly)?|annual.report"
         r"|asx.listed|listed.company|on.the.asx"
         r"|earnings.*result|results.*asx|asx.*result"
-        r"|interpret.*asx|fetch.*asx|ingest.*asx)\b",
+        r"|interpret.*asx|fetch.*asx|ingest.*asx"
+        r"|capital.raise|placement|prospectus|appendix.4[ce]"
+        r"|what did \w+ announce|latest.*announcement|recent.*announcement)\b",
         re.IGNORECASE,
     )
 
-    # Explicit ASX tag: "ASX:BHP", "[asx:CBA]", "asx BHP"
-    _ASX_TAG = re.compile(r"(?:ASX[:\s]|\[asx:\s*)([A-Z]{2,5})", re.IGNORECASE)
+    # Explicit ASX tag: "ASX:BHP", "[asx:CBA]", "asx:bhp"
+    _ASX_TAG = re.compile(r"(?:ASX[:\s]|\[asx:\s*)([A-Za-z]{2,5})", re.IGNORECASE)
+
+    # Financial / ASX context words that raise confidence of nearby tokens
+    _FINANCIAL_CONTEXT = re.compile(
+        r"\b(asx|announce(d|ment|s)?|result|earnings|dividend|report|quarterly"
+        r"|half.year|annual|interpret|ingest|fetch|listed|market.sensitive"
+        r"|price.sensitive|acquire|acquisition|placement|capital.raise"
+        r"|revenue|profit|loss|ebitda|npat|eps|dps|guidance)\b",
+        re.IGNORECASE,
+    )
+
+    # Words that look like 2-5 letter uppercase tokens but are NOT tickers
+    _NOT_TICKERS: set = {
+        # Articles / prepositions / conjunctions
+        "A", "AN", "THE", "AND", "OR", "FOR", "OF", "TO", "IN", "ON",
+        "BY", "AT", "AS", "IS", "IT", "BE", "DO", "GO", "NO", "SO",
+        "UP", "US", "WE", "IF", "MY", "HE", "ME", "HI",
+        # Pronouns / question words
+        "WHO", "WHY", "HOW", "WHAT", "WHEN", "WHERE", "WHICH",
+        # Common verbs (all-caps in message)
+        "DID", "HAS", "HAD", "ARE", "WAS", "WERE", "BEEN", "HAVE",
+        "WILL", "CAN", "MAY", "COULD", "WOULD", "SHOULD",
+        "GET", "GOT", "SAY", "SAID", "MAKE", "MADE", "KNOW", "SHOW",
+        "TELL", "GIVE", "FIND", "LOOK", "WANT", "NEED", "CALL", "COME",
+        "TAKE", "KEEP", "SEEM", "FEEL", "MEAN", "HELP", "PUT",
+        # Adjectives / adverbs
+        "LAST", "NEXT", "NEW", "OLD", "BIG", "JUST", "ALSO", "ONLY",
+        "MOST", "MORE", "LESS", "SOME", "VERY", "WELL", "BEST",
+        "GOOD", "HIGH", "LOW", "TOP", "KEY", "LONG", "FULL", "HALF",
+        # Common nouns
+        "DAY", "YEAR", "DATE", "TIME", "WEEK", "MONTH",
+        "NEWS", "STOCK", "SHARE", "PRICE", "MARKET", "FUND",
+        "FIRM", "BOARD", "TEAM", "PLAN", "DEAL",
+        # Intent / command words
+        "SHOW", "LIST", "FETCH", "INGEST", "SAVE", "STORE", "SEARCH",
+        "QUERY", "FIND", "ANALYSE", "ANALYZE", "INTERPRET", "REVIEW",
+        "READ", "ABOUT", "RECENT", "LATEST",
+        # Financials / acronyms that are NOT tickers
+        "ASX", "CEO", "CFO", "COO", "CTO", "EPS", "DPS", "DPS",
+        "IPO", "FY", "HY", "GDP", "ROI", "ESG", "FCF", "EBIT",
+        "NPAT", "CAPEX", "OPEX", "P&L", "NAV", "NTA", "YOY", "MOM",
+        "ETF", "LTD", "PTY", "INC", "LLC", "PLC", "USD", "AUD",
+        "NZD", "EUR", "GBP",
+    }
 
     def _parse_asx_tag(self, message: str) -> Optional[str]:
         """Return explicitly tagged ASX ticker or None."""
         m = self._ASX_TAG.search(message)
         return m.group(1).upper() if m else None
+
+    def _extract_ticker(self, message: str) -> Optional[str]:
+        """
+        Extract the most likely ASX ticker symbol from a free-text message.
+
+        Four-pass strategy (highest → lowest confidence):
+          1. Explicit tag:  "ASX:BHP", "[asx:cba]", "asx bhp"  → always trusted
+          2. Uppercase tokens (2-5 chars) not in _NOT_TICKERS   → high confidence
+          3. Any-case tokens + financial context keyword nearby  → medium confidence
+          4. Any-case tokens, last resort (user chose ASX route) → low confidence
+
+        All matches are normalised to UPPERCASE before returning.
+        """
+        # Pass 1 — explicit tag (most reliable)
+        m = self._ASX_TAG.search(message)
+        if m:
+            return m.group(1).upper()
+
+        # Pass 2 — uppercase tokens only (e.g. "BHP", "CBA")
+        for word in re.findall(r"\b([A-Z]{2,5})\b", message):
+            if word not in self._NOT_TICKERS:
+                return word
+
+        # Pass 3 — any-case tokens, but only when financial keywords are present
+        has_financial = bool(self._FINANCIAL_CONTEXT.search(message))
+        if has_financial:
+            for word in re.findall(r"\b([A-Za-z]{2,5})\b", message):
+                upper = word.upper()
+                if upper not in self._NOT_TICKERS:
+                    return upper
+
+        # Pass 4 — any-case tokens, last resort (user is already in ASX pipeline)
+        for word in re.findall(r"\b([A-Za-z]{2,5})\b", message):
+            upper = word.upper()
+            if upper not in self._NOT_TICKERS:
+                return upper
+
+        return None
 
     def _classify(self, message: str) -> str:
         """
@@ -442,17 +525,7 @@ class Pipeline:
         """
         # Resolve ticker from message if not already extracted by tag
         if not ticker:
-            # Look for 2-5 uppercase letter tokens excluding common words
-            _NOT_TICKERS = {
-                "I", "A", "AN", "THE", "AND", "OR", "FOR", "OF", "TO", "IN",
-                "ON", "BY", "IS", "IT", "BE", "DO", "GO", "NO", "SO", "UP",
-                "US", "WE", "ARE", "WAS", "HAS", "ASX", "CEO", "CFO", "EPS",
-                "DPS", "IPO", "FY", "HY", "GDP", "ROI", "ESG", "FCF",
-            }
-            for word in re.findall(r"\b([A-Z]{2,5})\b", message):
-                if word not in _NOT_TICKERS:
-                    ticker = word
-                    break
+            ticker = self._extract_ticker(message)
 
         if not ticker:
             return (
