@@ -480,6 +480,8 @@ def run_ai_agents():
             "asx_interpretation": "",
             "asx_selected_idx":   0,
             "asx_chat_history":   [],
+            "asx_signal":         "",   # latest trading signal markdown
+            "asx_signal_idx":     0,    # which announcement the signal is for
         }.items():
             if _key not in st.session_state:
                 st.session_state[_key] = _default
@@ -555,7 +557,7 @@ def run_ai_agents():
             selected_ann = anns[selected_idx]
 
             # Per-announcement action buttons
-            act_col1, act_col2, act_col3 = st.columns(3)
+            act_col1, act_col2, act_col3, act_col4 = st.columns(4)
 
             with act_col1:
                 if st.button("⚡ Quick Interpret (direct LLM)", key="asx_interpret"):
@@ -650,6 +652,72 @@ def run_ai_agents():
                         f"⏭ skipped: {skipped}, "
                         f"❌ errors: {errors}"
                     )
+
+            with act_col4:
+                if st.button("🎯 Trading Signal", key="asx_signal_btn",
+                             help="AI trading signal: buy/sell/hold + price targets per timeframe. NOT financial advice."):
+                    from agents.asx_announcement_agent import (
+                        download_pdf_bytes,
+                        extract_text_from_pdf_bytes,
+                    )
+                    from agents.asx_trading_signal import (
+                        fetch_all_timeframes,
+                        generate_trading_signal,
+                    )
+                    pdf_url = selected_ann.get("url", "")
+                    with st.spinner(
+                        "Fetching live price data + generating AI trading signal… (~20–40 s)"
+                    ):
+                        try:
+                            # Reuse cached PDF text
+                            if pdf_url not in st.session_state.asx_pdf_cache:
+                                pdf_bytes = download_pdf_bytes(pdf_url)
+                                pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+                                st.session_state.asx_pdf_cache[pdf_url] = pdf_text
+                            else:
+                                pdf_text = st.session_state.asx_pdf_cache[pdf_url]
+
+                            # Fetch multi-timeframe OHLCV + indicators
+                            ticker_sym       = selected_ann.get("ticker", "")
+                            indicators_by_tf = fetch_all_timeframes(ticker_sym)
+                            available        = [tf for tf, v in indicators_by_tf.items() if v]
+                            if not available:
+                                st.warning(
+                                    f"⚠️ Live price data unavailable for {ticker_sym}.AX — "
+                                    "signal will be based on announcement text only. "
+                                    "Yahoo Finance may be rate-limiting or the ticker is lightly traded."
+                                )
+                            else:
+                                st.info(f"📊 Price data loaded for timeframes: {', '.join(available)}")
+
+                            signal_md = generate_trading_signal(
+                                selected_ann, pdf_text, indicators_by_tf
+                            )
+                            st.session_state.asx_signal     = signal_md
+                            st.session_state.asx_signal_idx = selected_idx
+                        except Exception as exc:
+                            st.error(f"❌ Signal generation failed: {exc}")
+
+            # ── Trading signal display ───────────────────────────────────────
+            if st.session_state.asx_signal:
+                sig_ann = anns[st.session_state.asx_signal_idx]
+                st.divider()
+                st.subheader(
+                    f"🎯 AI Trading Signal — {sig_ann['ticker']} "
+                    f"({(sig_ann['document_date'] or '')[:10]})"
+                )
+                st.error(
+                    "⚠️ **NOT FINANCIAL ADVICE** — AI-generated signal for informational "
+                    "and educational purposes only. Always consult a licensed financial "
+                    "adviser before making any investment decision. DataPAI accepts no "
+                    "responsibility for trading decisions based on this output.",
+                    icon="⚠️",
+                )
+                st.markdown(st.session_state.asx_signal)
+                st.caption(
+                    f"Signal generated from: {sig_ann['headline'][:80]}  |  "
+                    "LLM chain: Gemini flash-lite → GPT-5.1 reviewer"
+                )
 
             # ── Interpretation display + follow-up chat ─────────────────────
             if st.session_state.asx_interpretation:

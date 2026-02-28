@@ -717,6 +717,110 @@ def health_check() -> HealthResponse:
     )
 
 
+# ── ASX Trading Signal ─────────────────────────────────────────────────────────
+
+class ASXTradingSignalRequest(BaseModel):
+    ticker:          str
+    announcement_id: Optional[str] = None   # None → use latest announcement
+    max_doc_chars:   int            = 6000
+
+
+@app.post("/v1/asx/signal", dependencies=[Depends(_check_api_key)])
+def asx_trading_signal(req: ASXTradingSignalRequest) -> dict:
+    """
+    Generate a structured AI trading signal for an ASX ticker.
+
+    Combines the latest (or specified) ASX announcement with live
+    multi-timeframe technical indicators (5m / 30m / 1h / daily via yfinance)
+    and passes both to a Gemini flash-lite → GPT-5.1 LLM chain.
+
+    ⚠️  The signal is AI-generated for INFORMATIONAL PURPOSES ONLY.
+        It is NOT financial advice.  Prominent disclaimers are embedded
+        in the returned signal_markdown field.
+
+    Response keys
+    -------------
+    ticker               : str   — upper-case ASX ticker
+    announcement_id      : str   — ID of the selected announcement
+    headline             : str   — announcement headline
+    date                 : str   — YYYY-MM-DD
+    market_sensitive     : bool
+    signal_markdown      : str   — full formatted signal with disclaimer blocks
+    price_data_available : bool  — False if yfinance failed for all timeframes
+    timeframes_available : list  — e.g. ["30m", "1h", "1d"]
+    source_url           : str   — PDF URL of the announcement
+    """
+    from agents.asx_announcement_agent import (
+        fetch_asx_announcements,
+        download_pdf_bytes,
+        extract_text_from_pdf_bytes,
+    )
+    from agents.asx_trading_signal import fetch_all_timeframes, generate_trading_signal
+
+    ticker = req.ticker.upper().strip()
+
+    # Fetch announcement list
+    try:
+        anns = fetch_asx_announcements(ticker, count=5)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ASX API error fetching announcements for {ticker}: {exc}",
+        )
+    if not anns:
+        raise HTTPException(status_code=404, detail=f"No announcements found for {ticker}.")
+
+    # Select announcement (latest or by ID)
+    selected = anns[0]
+    if req.announcement_id:
+        for a in anns:
+            if a.get("id") == req.announcement_id:
+                selected = a
+                break
+
+    # Download + extract PDF text
+    pdf_url  = selected.get("url", "")
+    pdf_text = ""
+    if pdf_url:
+        try:
+            pdf_bytes = download_pdf_bytes(pdf_url)
+            pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+        except Exception as exc:
+            logger.warning("PDF extraction failed for signal (%s): %s", pdf_url, exc)
+
+    # Fetch OHLCV + calculate indicators for all timeframes
+    try:
+        indicators_by_tf = fetch_all_timeframes(ticker)
+    except Exception as exc:
+        logger.warning("fetch_all_timeframes failed for %s: %s", ticker, exc)
+        indicators_by_tf = {"5m": None, "30m": None, "1h": None, "1d": None}
+
+    available_tfs = [tf for tf, v in indicators_by_tf.items() if v is not None]
+
+    # Generate signal via Gemini → GPT chain
+    try:
+        signal_md = generate_trading_signal(
+            announcement     = selected,
+            pdf_text         = pdf_text,
+            indicators_by_tf = indicators_by_tf,
+            max_doc_chars    = req.max_doc_chars,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Signal generation error: {exc}")
+
+    return {
+        "ticker":               ticker,
+        "announcement_id":      selected.get("id", ""),
+        "headline":             selected.get("headline", ""),
+        "date":                 (selected.get("document_date") or "")[:10],
+        "market_sensitive":     selected.get("market_sensitive", False),
+        "signal_markdown":      signal_md,
+        "price_data_available": len(available_tfs) > 0,
+        "timeframes_available": available_tfs,
+        "source_url":           pdf_url,
+    }
+
+
 # ── Cost / budget status ────────────────────────────────────────────────────────
 
 @app.get("/v1/cost/status")

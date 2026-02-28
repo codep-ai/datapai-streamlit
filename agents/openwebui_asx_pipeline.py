@@ -81,6 +81,7 @@ class Pipeline:
         OLLAMA_HOST:            str  = os.getenv("OLLAMA_HOST",             "http://localhost:11434")
         ASX_DEFAULT_COUNT:      int  = int(os.getenv("ASX_DEFAULT_COUNT",   "20"))
         ASX_MARKET_SENSITIVE:   bool = os.getenv("ASX_MARKET_SENSITIVE",    "false").lower() == "true"
+        ASX_SIGNAL_TIMEOUT:     int  = int(os.getenv("ASX_SIGNAL_TIMEOUT",  "180"))  # signal = 2 LLM calls + yfinance
 
     def __init__(self):
         self.name   = "DataPAI ASX Announcements"
@@ -125,40 +126,72 @@ class Pipeline:
                 "- `Interpret BHP latest announcement`\n"
                 "- `Fetch 10 announcements for CBA`\n"
                 "- `What did ANZ announce about their results?`\n"
-                "- `Ingest RIO announcements to knowledge base`\n\n"
-                "You can also use the explicit tag: `ASX:TICKER interpret`"
+                "- `Ingest RIO announcements to knowledge base`\n"
+                "- `Trading signal for BHP` — AI signal with buy/sell/hold + price targets\n\n"
+                "You can also use the explicit tag: `ASX:TICKER interpret` or `ASX:TICKER signal`\n\n"
+                "> ⚠️ Trading signals are AI-generated for informational purposes only. "
+                "NOT financial advice."
             )
 
         if intent == "fetch":
             return self._handle_fetch(ticker, count)
         elif intent == "ingest":
             return self._handle_ingest(ticker, count)
+        elif intent == "signal":
+            return self._handle_signal(ticker)
         else:
             # Default to interpret (also handles natural language questions)
             return self._handle_interpret(ticker, question)
 
     # ── Intent + ticker parsing ────────────────────────────────────────────
 
-    # Regex: explicit ASX tag  e.g. "ASX:BHP" or "[asx:cba]"
-    _EXPLICIT_TAG = re.compile(r"(?:ASX[:\s]|asx[:\s]|\[asx:\s*)([A-Z]{2,5})", re.IGNORECASE)
+    # Regex: explicit ASX tag — "ASX:BHP", "asx:cba", "[asx: rio]", "ASX bhp"
+    _EXPLICIT_TAG = re.compile(
+        r"(?:ASX[:\s]+|\[asx:\s*)([A-Za-z]{2,5})", re.IGNORECASE
+    )
 
-    # Regex: standalone uppercase 2-5 letter words likely to be ASX tickers
-    _TICKER_PATTERN = re.compile(r"\b([A-Z]{2,5})\b")
-
-    # Common English words to exclude from ticker detection
-    _NOT_TICKERS = {
-        "I", "A", "AN", "THE", "AND", "OR", "BUT", "FOR", "OF", "TO", "IN",
+    # Words to EXCLUDE from ticker candidates — case-insensitive comparison.
+    # Covers common English words, financial acronyms, and intent words that
+    # would otherwise look like 2-5 letter tickers.
+    _NOT_TICKERS: set = {
+        # Articles / prepositions / conjunctions
+        "A", "AN", "THE", "AND", "OR", "BUT", "FOR", "OF", "TO", "IN",
         "ON", "AT", "BY", "AS", "IS", "IT", "BE", "DO", "GO", "MY", "NO",
-        "SO", "UP", "US", "WE", "YOU", "ARE", "WAS", "HAS", "HAD", "HAVE",
-        "GET", "GOT", "LET", "PUT", "SAY", "SET", "DID", "CAN", "MAY", "HOW",
-        "WHY", "WHO", "WHAT", "WHEN", "WHERE", "WHICH", "WITH", "THIS", "THAT",
-        "FROM", "INTO", "OVER", "THEN", "THAN", "ALSO", "BOTH", "EACH", "FEW",
-        "MORE", "MOST", "MUCH", "MANY", "ONLY", "SOME", "SUCH", "TELL", "SHOW",
-        "LIST", "GIVE", "TAKE", "MAKE", "LIKE", "KNOW", "LOOK", "FIND", "WANT",
-        "NEED", "THINK", "JUST", "EVEN", "WELL", "ALSO", "ASX", "PDF", "CEO",
-        "CFO", "COO", "AGM", "EGM", "NTA", "DPS", "EPS", "IPO", "FY", "HY",
-        "Q1", "Q2", "Q3", "Q4", "YOY", "MOM", "GDP", "RBA", "ATO", "ASX",
-        "ASIC", "APRA", "ACCC", "ESG", "ROI", "EBIT", "NPAT", "FCF", "CAPEX",
+        "SO", "UP", "US", "WE", "IF", "HE", "ME", "AM",
+        # Pronouns / question words
+        "YOU", "WHO", "WHY", "HOW", "WHAT", "WHEN", "WHERE", "WHICH",
+        "THIS", "THAT", "THEY", "THEM", "THEIR", "THESE", "THOSE",
+        "HIM", "HER", "ITS", "OUR", "YOUR",
+        # Common verbs (3-5 chars)
+        "ARE", "WAS", "HAS", "HAD", "HAVE", "BEEN", "WERE",
+        "GET", "GOT", "LET", "PUT", "SAY", "SET", "DID", "CAN", "MAY",
+        "WILL", "DOES", "DONE", "WENT", "COME", "CAME",
+        "TELL", "SHOW", "GIVE", "TAKE", "MAKE", "LIKE", "KNOW", "LOOK",
+        "FIND", "WANT", "NEED", "SEEM", "FEEL", "KEEP", "MADE", "SAID",
+        "USED", "CALL", "WORK", "JUST", "ALSO", "THAN", "THEN", "EVEN",
+        "WELL", "BACK", "MUCH", "HELP", "HOLD", "TURN", "OPEN", "MOVE",
+        # Common adjectives / adverbs
+        "GOOD", "BEST", "MOST", "MANY", "MUCH", "SOME", "ONLY", "VERY",
+        "BOTH", "EACH", "SUCH", "FULL", "FREE", "REAL", "SAME", "LONG",
+        "LAST", "NEXT", "LESS", "MORE", "LATE", "EARLY", "HIGH", "JUST",
+        "OVER", "INTO", "FROM", "WITH", "ALSO", "EACH", "FEW", "NEW",
+        # Common nouns
+        "TIME", "YEAR", "WEEK", "DAYS", "DATE", "TEXT", "DATA", "NEWS",
+        "PART", "AREA", "CASE", "FORM", "TERM", "FACT", "RATE", "HALF",
+        "ONCE", "THEN", "THEM", "THAN", "THAN", "THUS", "ELSE",
+        # Intent / command words (to avoid self-matching)
+        "FETCH", "LIST", "SHOW", "FIND", "SAVE", "INGEST", "STORE",
+        "EMBED", "INDEX", "HELP", "INFO", "TELL", "GIVE",
+        # Financial acronyms that aren't ASX tickers
+        "ASX", "PDF", "CEO", "CFO", "COO", "CTO", "AGM", "EGM",
+        "NTA", "DPS", "EPS", "IPO", "FY", "HY", "PY",
+        "Q1", "Q2", "Q3", "Q4", "H1", "H2",
+        "YOY", "MOM", "WOW", "GDP", "CPI", "RBA", "ATO", "ABS",
+        "ASIC", "APRA", "ACCC", "AUSTRAC",
+        "ESG", "ROI", "ROE", "ROA", "EBIT", "NPAT", "FCF", "CAPEX",
+        "OPEX", "EBITDA", "CAGR", "IRR", "NAV", "NTA", "PNL",
+        # Common 2-char words already handled but listed for completeness
+        "OF", "TO", "IN", "IS", "IT", "BE", "AS", "AT", "BY", "OR",
     }
 
     # Keywords signalling list/fetch intent
@@ -173,13 +206,67 @@ class Pipeline:
         re.IGNORECASE,
     )
 
-    # Keywords signalling interpret/analyse intent
+    # Keywords signalling interpret/analyse intent (also used as "financial context")
     _INTERPRET_WORDS = re.compile(
         r"\b(interpret|analyse|analyze|summary|summarize|explain|what did|tell me"
         r"|results?|earnings?|report|quarterly|half.year|annual|guidance|dividend"
-        r"|acquisition|capital raise|profit|revenue|outlook|material)\b",
+        r"|acquisition|capital raise|profit|revenue|outlook|material|announce)\b",
         re.IGNORECASE,
     )
+
+    # Keywords signalling trading signal intent
+    _SIGNAL_WORDS = re.compile(
+        r"\b(signal|trade|trading signal|buy|sell|strong buy|strong sell"
+        r"|entry|stop.?loss|take.?profit|price target|technical analysis"
+        r"|rsi|macd|bollinger|ema|moving average|ohlcv|candlestick|chart"
+        r"|should i (buy|sell)|when to (buy|sell)|is it a buy|is it a sell"
+        r"|bullish|bearish|momentum|breakout|support|resistance)\b",
+        re.IGNORECASE,
+    )
+
+    def _extract_ticker(self, message: str) -> Optional[str]:
+        """
+        Robustly extract an ASX ticker from any message — any case.
+
+        Priority:
+          1. Explicit tag: "ASX:BHP", "asx:bhp", "ASX bhp"  → always trusted
+          2. Uppercase token in original message: "BHP" → high confidence
+          3. Any 2-5 letter token (any case) with financial context nearby
+             e.g. "bhp results", "What did cba announce?"  → medium confidence
+          4. Any 2-5 letter token (any case) if no match yet
+             (last resort; ASX API will validate and return 404 if wrong)
+
+        All candidates are normalised to uppercase and checked against
+        _NOT_TICKERS before being returned.
+        """
+        # 1. Explicit ASX tag (case insensitive)
+        explicit = self._EXPLICIT_TAG.search(message)
+        if explicit:
+            return explicit.group(1).upper()
+
+        has_financial = bool(self._INTERPRET_WORDS.search(message) or self._FETCH_WORDS.search(message))
+
+        # 2. Uppercase-only tokens in original message (e.g. "BHP", "CBA")
+        for word in re.findall(r"\b([A-Z]{2,5})\b", message):
+            if word not in self._NOT_TICKERS:
+                return word
+
+        # 3. Any case — but only when financial context words are present
+        #    (avoids "What is the API rate?" → "API" being treated as a ticker)
+        if has_financial:
+            for word in re.findall(r"\b([A-Za-z]{2,5})\b", message):
+                upper = word.upper()
+                if upper not in self._NOT_TICKERS:
+                    return upper
+
+        # 4. Last resort: any case, no context requirement
+        #    (user selected this pipeline explicitly, so likely intentional)
+        for word in re.findall(r"\b([A-Za-z]{2,5})\b", message):
+            upper = word.upper()
+            if upper not in self._NOT_TICKERS:
+                return upper
+
+        return None
 
     def _parse_message(
         self, message: str
@@ -187,52 +274,44 @@ class Pipeline:
         """
         Parse user message and return (intent, ticker, count, question).
 
-        intent: "fetch" | "interpret" | "ingest"
-        ticker: ASX ticker symbol or None
-        count:  number of announcements requested
+        intent:   "fetch" | "interpret" | "ingest"
+        ticker:   ASX ticker symbol (any case input, always returned uppercase) or None
+        count:    number of announcements requested
         question: specific question to answer (for QA mode)
         """
-        # 1. Try explicit ASX tag first
-        explicit = self._EXPLICIT_TAG.search(message)
-        ticker   = explicit.group(1).upper() if explicit else None
+        ticker = self._extract_ticker(message)
 
-        # 2. Fall back to uppercase word detection
-        if not ticker:
-            candidates = self._TICKER_PATTERN.findall(message)
-            for candidate in candidates:
-                if candidate.upper() not in self._NOT_TICKERS and len(candidate) >= 2:
-                    ticker = candidate.upper()
-                    break
-
-        # 3. Detect count ("fetch last 10 for BHP")
+        # Detect count ("fetch last 10 for BHP", "show 5 announcements")
         count_match = re.search(r"\b(\d+)\b", message)
         count = int(count_match.group(1)) if count_match else self.valves.ASX_DEFAULT_COUNT
         count = max(1, min(count, 50))
 
-        # 4. Detect intent
+        # Detect intent — signal takes priority over interpret
         if self._INGEST_WORDS.search(message):
             intent = "ingest"
+        elif self._SIGNAL_WORDS.search(message):
+            intent = "signal"
         elif self._FETCH_WORDS.search(message) and not self._INTERPRET_WORDS.search(message):
             intent = "fetch"
         else:
             intent = "interpret"
 
-        # 5. Extract user's specific question (strip ticker and intent words)
+        # Extract user's specific question (strip ticker and intent words)
         question: Optional[str] = None
-        if intent == "interpret":
+        if intent == "interpret" and ticker:
             clean = re.sub(
-                r"\b" + re.escape(ticker or "") + r"\b",
+                r"\b" + re.escape(ticker) + r"\b",
                 "",
                 message,
                 flags=re.IGNORECASE,
             ).strip()
             clean = re.sub(r"\s+", " ", clean).strip()
-            # If question is substantive (not just "interpret BHP"), pass it through
+            # Only pass through as a question if it's substantive
             if len(clean) > 10 and not re.fullmatch(
-                r"(interpret|analyse|analyze|summary|summarize|latest|report|results?)\s*",
+                r"(interpret|analyse|analyze|summary|summarize|latest|report|results?|announce(ment)?)\s*",
                 clean.lower().strip(),
             ):
-                question = clean if clean else None
+                question = clean
 
         return intent, ticker, count, question
 
@@ -377,3 +456,56 @@ class Pipeline:
             f"`What did {ticker} say about their outlook?`",
         ]
         return "\n".join(lines)
+
+    def _handle_signal(self, ticker: str) -> str:
+        """
+        Generate an AI trading signal for the latest ASX announcement.
+
+        Calls POST /v1/asx/signal on the RAG API backend, which:
+          1. Fetches the latest announcement PDF for the ticker
+          2. Retrieves live multi-timeframe OHLCV data via yfinance
+          3. Calculates RSI, MACD, Bollinger Bands, EMAs (pure pandas)
+          4. Runs Gemini flash-lite → GPT-5.1 reviewer LLM chain
+          5. Returns a structured signal with entry/target/stop-loss per timeframe
+
+        ⚠️ Output is AI-generated for informational purposes ONLY.
+           NOT financial advice. Prominent disclaimers are embedded in the signal.
+        """
+        try:
+            resp = requests.post(
+                f"{self.valves.DATAPAI_RAG_API_URL}/v1/asx/signal",
+                json={"ticker": ticker, "max_doc_chars": 6000},
+                headers=self._api_headers(),
+                timeout=self.valves.ASX_SIGNAL_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.ConnectionError:
+            return (
+                f"⚠️ DataPAI RAG API not reachable at `{self.valves.DATAPAI_RAG_API_URL}`.\n"
+                f"Please ensure the service is running on EC2 #2."
+            )
+        except Exception as exc:
+            return f"⚠️ Signal generation failed for **{ticker}**: `{exc}`"
+
+        signal_md = data.get("signal_markdown", "No signal returned.")
+        headline  = data.get("headline", "")[:70]
+        date      = data.get("date", "")
+        tfs       = data.get("timeframes_available", [])
+        mkt_sens  = "🔴 Market Sensitive" if data.get("market_sensitive") else ""
+
+        header = [
+            f"## 🎯 AI Trading Signal — {ticker} ({date})",
+            f"**{headline}** {mkt_sens}",
+            "",
+            "> ⚠️ **NOT FINANCIAL ADVICE** — AI-generated for informational purposes only.",
+            "",
+        ]
+        footer = [
+            "",
+            "---",
+            f"📊 Price data loaded for: {', '.join(tfs) if tfs else 'none (signal from announcement text only)'}",
+            "🤖 LLM chain: Gemini flash-lite → GPT-5.1 reviewer",
+            f"💡 Try: `interpret {ticker}` for a pure announcement analysis.",
+        ]
+        return "\n".join(header) + signal_md + "\n".join(footer)
