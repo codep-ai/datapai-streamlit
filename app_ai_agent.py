@@ -506,6 +506,7 @@ def run_ai_agents():
         fetch_btn = st.button("🔍 Fetch Announcements", key="asx_fetch")
 
         if fetch_btn and tickers_input.strip():
+            
             from agents.asx_announcement_agent import fetch_asx_announcements as _fetch
 
             tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
@@ -523,6 +524,7 @@ def run_ai_agents():
             st.session_state.asx_interpretation = ""
             st.session_state.asx_chat_history   = []
             st.session_state.asx_selected_idx   = 0
+            
 
         # ── Announcements table + actions ───────────────────────────────────
         if st.session_state.asx_announcements:

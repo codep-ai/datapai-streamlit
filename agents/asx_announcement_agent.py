@@ -22,14 +22,24 @@ LLM routing via RouterChatClient — respects LLM_MODE / LLM_PRIMARY_PROVIDER en
 from __future__ import annotations
 
 import io
+import re
 import os
 import logging
 from typing import Any, Dict, List, Optional
 
 import requests
 
+from bs4 import BeautifulSoup
+from datetime import datetime
+
+current_year = datetime.now().year
+
 logger = logging.getLogger(__name__)
 
+_ASX_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 # ---------------------------------------------------------------------------
 # ASX API constants
 # ---------------------------------------------------------------------------
@@ -37,22 +47,21 @@ logger = logging.getLogger(__name__)
 _ASX_API_BASE = "https://www.asx.com.au/asx/1/company"
 
 # ASX blocks plain bot requests; these headers mimic a browser.
-_ASX_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://www.asx.com.au/",
-    "Accept": "application/json, text/plain, */*",
-}
-
+# _ASX_HEADERS = {
+#     "User-Agent": (
+#         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+#         "AppleWebKit/537.36 (KHTML, like Gecko) "
+#         "Chrome/120.0.0.0 Safari/537.36"
+#     ),
+#     "Referer": "https://www.asx.com.au/",
+#     "Accept": "application/json, text/plain, */*",
+# }
 # ---------------------------------------------------------------------------
 # LLM prompts
 # ---------------------------------------------------------------------------
 
 _SYSTEM_SUMMARY = (
-    "You are a senior financial analyst specialising in ASX-listed companies. "
+    "You are a pricipal financial analyst specialising in ASX-listed companies. "
     "Analyse the provided ASX market announcement and return a structured report covering:\n"
     "1. **Executive Summary** — 2-3 sentence overview of what was announced\n"
     "2. **Key Financial Figures** — revenue, EBITDA, NPAT, EPS, DPS, guidance (if present)\n"
@@ -75,72 +84,104 @@ _SYSTEM_QA = (
 # Fetch announcement list from ASX
 # ---------------------------------------------------------------------------
 
-def fetch_asx_announcements(
-    ticker: str,
-    count: int = 20,
-    market_sensitive_only: bool = False,
-) -> List[Dict[str, Any]]:
-    """
-    Fetch latest announcements for an ASX-listed ticker.
 
-    Args:
-        ticker:               ASX ticker symbol (e.g. "BHP", "CBA")
-        count:                Max number of announcements to return (1–100)
-        market_sensitive_only: If True, only return market-sensitive announcements
 
-    Returns:
-        List of announcement metadata dicts with keys:
-            id, ticker, document_date, headline, url,
-            market_sensitive, number_of_pages, size_kb, doc_type
+PDF_HOST_RE = re.compile(r"^https?://announcements\.asx\.com\.au/asxpdf/.*\.pdf", re.I)
 
-    Raises:
-        ValueError: If ticker not found or API response format unexpected.
-        requests.HTTPError: On HTTP errors.
-    """
-    ticker = ticker.upper().strip()
-    url = f"{_ASX_API_BASE}/{ticker}/announcements"
-    params: Dict[str, Any] = {
-        "count": min(max(count, 1), 100),
-        "market_sensitive": "true" if market_sensitive_only else "false",
+META_RE = re.compile(
+    r"(?P<head>.*?)(?:\s+)(?P<pages>\d+)\s+pages?\s+(?P<size>[\d.]+)\s*(?P<unit>KB|MB)\s*$",
+    re.I,
+)
+
+def parse_asx_announcements_html(html: str, ticker: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "lxml")
+
+    out: List[Dict[str, Any]] = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+
+        # Normalize relative links if any (rare, but safe)
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            href = "https://www.asx.com.au" + href
+
+        if not PDF_HOST_RE.match(href):
+            continue
+
+        text = " ".join(a.get_text(" ", strip=True).split())
+
+        pages = 0
+        size_kb = 0.0
+        headline = text
+
+        m = META_RE.match(text)
+        if m:
+            headline = m.group("head").strip(" -–—")
+            pages = int(m.group("pages"))
+            size = float(m.group("size"))
+            unit = m.group("unit").upper()
+            size_kb = size * 1024.0 if unit == "MB" else size
+
+        # Try to capture the date/time from the closest row/container text
+        # (ASX markup varies; this is a best-effort)
+        container = a.find_parent(["tr", "li", "div"]) or a.parent
+        container_text = " ".join(container.get_text(" ", strip=True).split()) if container else ""
+        # Often date like "28/02/2026 09:31:12" appears nearby
+        date_match = re.search(r"\b\d{2}/\d{2}/\d{4}\b(?:\s+\d{2}:\d{2}:\d{2})?", container_text)
+        document_date = date_match.group(0) if date_match else ""
+
+        out.append({
+            "id": "",
+            "ticker": ticker,
+            "document_date": document_date,
+            "headline": headline or "—",
+            "url": href,
+            "market_sensitive": False,
+            "number_of_pages": pages,
+            "size_kb": round(size_kb, 1),
+            "doc_type": "",
+        })
+
+    return out
+
+def fetch_asx_announcements(ticker: str, count: int = 20, market_sensitive_only: bool = False):
+    ticker = ticker.strip().upper()
+    year = datetime.now().year
+
+    params = {
+        "asxCode": ticker,
+        "by": "asxCode",
+        "timeframe": "Y",
+        "year": year,
     }
 
-    try:
-        resp = requests.get(url, params=params, headers=_ASX_HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
-            raise ValueError(f"Ticker '{ticker}' not found on ASX.") from exc
-        raise
+    url = "https://www.asx.com.au/asx/v2/statistics/announcements.do"
+    resp = requests.get(url, params=params, headers=_ASX_HEADERS, timeout=20)
 
-    raw = resp.json()
+    debug_info = {
+    "final_url": resp.url,
+    "status_code": resp.status_code,
+    "content_type": resp.headers.get("Content-Type"),
+    "html_preview": resp.text[:300],
+    }
 
-    # ASX API wraps the list in {"data": [...]}
-    announcements_raw: List[dict]
-    if isinstance(raw, dict):
-        announcements_raw = raw.get("data", [])
-    elif isinstance(raw, list):
-        announcements_raw = raw
-    else:
-        raise ValueError(
-            f"Unexpected ASX API response format for {ticker}: {type(raw)}"
-        )
+    if resp.status_code != 200:
+        return [], debug_info
+    soup = BeautifulSoup(resp.text, "lxml")
+ 
 
-    return [
-        {
-            "id":               a.get("id", ""),
-            "ticker":           ticker,
-            "document_date":    a.get("document_date", ""),
-            "headline":         a.get("headline", "—"),
-            "url":              a.get("url", ""),
-            "market_sensitive": bool(a.get("market_sensitive", False)),
-            "number_of_pages":  int(a.get("number_of_pages") or 0),
-            "size_kb":          round(int(a.get("size") or 0) / 1024, 1),
-            "doc_type":         a.get("doc_type", ""),
-        }
-        for a in announcements_raw
-    ]
+    resp.raise_for_status()
 
+    items = parse_asx_announcements_html(resp.text, ticker)
 
+    logger = logging.getLogger(__name__)
+
+    logger.info("ASX request url=%s", resp.url)
+    logger.info("ASX status=%s content_type=%s", resp.status_code, resp.headers.get("Content-Type"))
+    # If you want “recent”: page is usually newest-first; keep first N
+    return items[: min(max(count, 1), 100)]
+    #return pdf_links[:count], debug_info
 # ---------------------------------------------------------------------------
 # PDF download + text extraction  (fully in-memory, no temp files)
 # ---------------------------------------------------------------------------
