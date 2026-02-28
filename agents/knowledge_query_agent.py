@@ -43,7 +43,7 @@ def search_lancedb(
         raise ValueError("Query is empty")
 
     if collections is None:
-        collections = ["documents", "pdfs", "images"]
+        collections = ["documents", "pdfs", "images", "asx_announcements"]
 
     db = _get_db()
     q_vec = embed_texts([query])[0]

@@ -94,6 +94,10 @@ class Pipeline:
         # RAG
         DATAPAI_RAG_TOP_K:      int  = int(os.getenv("DATAPAI_RAG_TOP_K",   "5"))
 
+        # ASX
+        ASX_DEFAULT_COUNT:      int  = int(os.getenv("ASX_DEFAULT_COUNT",   "20"))
+        ASX_MARKET_SENSITIVE:   bool = os.getenv("ASX_MARKET_SENSITIVE",    "false").lower() == "true"
+
         # Auth
         DATAPAI_RAG_API_KEY:    str  = os.getenv("DATAPAI_RAG_API_KEY",     "")
         DATAPAI_SQL_API_KEY:    str  = os.getenv("DATAPAI_SQL_API_KEY",     "")
@@ -144,10 +148,15 @@ class Pipeline:
         db_override = self._parse_db_tag(user_message)
         clean_msg   = re.sub(r"\[db:\w+\]", "", user_message, flags=re.IGNORECASE).strip()
 
+        # Check for explicit ASX tag first (e.g. "ASX:BHP interpret")
+        asx_ticker = self._parse_asx_tag(clean_msg)
+
         # Classify intent
         route = self._classify(clean_msg)
 
-        if route == "sql" or db_override:
+        if asx_ticker or route == "asx":
+            return self._route_asx(clean_msg, asx_ticker)
+        elif route == "sql" or db_override:
             return self._route_sql(clean_msg, db_override)
         elif route == "rag":
             return self._route_rag(clean_msg, messages)
@@ -176,9 +185,110 @@ class Pipeline:
         re.IGNORECASE,
     )
 
+    # ASX-intent keywords (heuristic fallback when Ollama classifier is down)
+    _ASX_KEYWORDS = re.compile(
+        r"\b(asx|announce(d|s|ment|ments)?|market.sensitive|price.sensitive"
+        r"|quarterly.result|half.year(ly)?|annual.report"
+        r"|asx.listed|listed.company|on.the.asx"
+        r"|earnings.*result|results.*asx|asx.*result"
+        r"|interpret.*asx|fetch.*asx|ingest.*asx"
+        r"|capital.raise|placement|prospectus|appendix.4[ce]"
+        r"|what did \w+ announce|latest.*announcement|recent.*announcement)\b",
+        re.IGNORECASE,
+    )
+
+    # Explicit ASX tag: "ASX:BHP", "[asx:CBA]", "asx:bhp"
+    _ASX_TAG = re.compile(r"(?:ASX[:\s]|\[asx:\s*)([A-Za-z]{2,5})", re.IGNORECASE)
+
+    # Financial / ASX context words that raise confidence of nearby tokens
+    _FINANCIAL_CONTEXT = re.compile(
+        r"\b(asx|announce(d|ment|s)?|result|earnings|dividend|report|quarterly"
+        r"|half.year|annual|interpret|ingest|fetch|listed|market.sensitive"
+        r"|price.sensitive|acquire|acquisition|placement|capital.raise"
+        r"|revenue|profit|loss|ebitda|npat|eps|dps|guidance)\b",
+        re.IGNORECASE,
+    )
+
+    # Words that look like 2-5 letter uppercase tokens but are NOT tickers
+    _NOT_TICKERS: set = {
+        # Articles / prepositions / conjunctions
+        "A", "AN", "THE", "AND", "OR", "FOR", "OF", "TO", "IN", "ON",
+        "BY", "AT", "AS", "IS", "IT", "BE", "DO", "GO", "NO", "SO",
+        "UP", "US", "WE", "IF", "MY", "HE", "ME", "HI",
+        # Pronouns / question words
+        "WHO", "WHY", "HOW", "WHAT", "WHEN", "WHERE", "WHICH",
+        # Common verbs (all-caps in message)
+        "DID", "HAS", "HAD", "ARE", "WAS", "WERE", "BEEN", "HAVE",
+        "WILL", "CAN", "MAY", "COULD", "WOULD", "SHOULD",
+        "GET", "GOT", "SAY", "SAID", "MAKE", "MADE", "KNOW", "SHOW",
+        "TELL", "GIVE", "FIND", "LOOK", "WANT", "NEED", "CALL", "COME",
+        "TAKE", "KEEP", "SEEM", "FEEL", "MEAN", "HELP", "PUT",
+        # Adjectives / adverbs
+        "LAST", "NEXT", "NEW", "OLD", "BIG", "JUST", "ALSO", "ONLY",
+        "MOST", "MORE", "LESS", "SOME", "VERY", "WELL", "BEST",
+        "GOOD", "HIGH", "LOW", "TOP", "KEY", "LONG", "FULL", "HALF",
+        # Common nouns
+        "DAY", "YEAR", "DATE", "TIME", "WEEK", "MONTH",
+        "NEWS", "STOCK", "SHARE", "PRICE", "MARKET", "FUND",
+        "FIRM", "BOARD", "TEAM", "PLAN", "DEAL",
+        # Intent / command words
+        "SHOW", "LIST", "FETCH", "INGEST", "SAVE", "STORE", "SEARCH",
+        "QUERY", "FIND", "ANALYSE", "ANALYZE", "INTERPRET", "REVIEW",
+        "READ", "ABOUT", "RECENT", "LATEST",
+        # Financials / acronyms that are NOT tickers
+        "ASX", "CEO", "CFO", "COO", "CTO", "EPS", "DPS", "DPS",
+        "IPO", "FY", "HY", "GDP", "ROI", "ESG", "FCF", "EBIT",
+        "NPAT", "CAPEX", "OPEX", "P&L", "NAV", "NTA", "YOY", "MOM",
+        "ETF", "LTD", "PTY", "INC", "LLC", "PLC", "USD", "AUD",
+        "NZD", "EUR", "GBP",
+    }
+
+    def _parse_asx_tag(self, message: str) -> Optional[str]:
+        """Return explicitly tagged ASX ticker or None."""
+        m = self._ASX_TAG.search(message)
+        return m.group(1).upper() if m else None
+
+    def _extract_ticker(self, message: str) -> Optional[str]:
+        """
+        Extract the most likely ASX ticker symbol from a free-text message.
+
+        Four-pass strategy (highest → lowest confidence):
+          1. Explicit tag:  "ASX:BHP", "[asx:cba]", "asx bhp"  → always trusted
+          2. Uppercase tokens (2-5 chars) not in _NOT_TICKERS   → high confidence
+          3. Any-case tokens + financial context keyword nearby  → medium confidence
+          4. Any-case tokens, last resort (user chose ASX route) → low confidence
+
+        All matches are normalised to UPPERCASE before returning.
+        """
+        # Pass 1 — explicit tag (most reliable)
+        m = self._ASX_TAG.search(message)
+        if m:
+            return m.group(1).upper()
+
+        # Pass 2 — uppercase tokens only (e.g. "BHP", "CBA")
+        for word in re.findall(r"\b([A-Z]{2,5})\b", message):
+            if word not in self._NOT_TICKERS:
+                return word
+
+        # Pass 3 — any-case tokens, but only when financial keywords are present
+        has_financial = bool(self._FINANCIAL_CONTEXT.search(message))
+        if has_financial:
+            for word in re.findall(r"\b([A-Za-z]{2,5})\b", message):
+                upper = word.upper()
+                if upper not in self._NOT_TICKERS:
+                    return upper
+
+        # Pass 4 — any-case tokens, last resort (user is already in ASX pipeline)
+        for word in re.findall(r"\b([A-Za-z]{2,5})\b", message):
+            upper = word.upper()
+            if upper not in self._NOT_TICKERS:
+                return upper
+
+        return None
+
     def _classify(self, message: str) -> str:
         """
-        Returns 'sql', 'rag', or 'chat'.
+        Returns 'asx', 'sql', 'rag', or 'chat'.
         Tries LLM classifier first; falls back to keyword heuristic.
         """
         # Try LLM classifier (fast, small model)
@@ -192,10 +302,11 @@ class Pipeline:
                             "role":    "system",
                             "content": (
                                 "You are a router. Classify the user question as exactly one of:\n"
+                                "  asx  — requires fetching or interpreting ASX market announcements\n"
                                 "  sql  — requires a database query or data analysis\n"
                                 "  rag  — requires document/knowledge-base lookup\n"
                                 "  chat — general assistant question\n"
-                                "Reply with ONE word only: sql, rag, or chat."
+                                "Reply with ONE word only: asx, sql, rag, or chat."
                             ),
                         },
                         {"role": "user", "content": message},
@@ -207,12 +318,14 @@ class Pipeline:
             )
             resp.raise_for_status()
             label = resp.json().get("message", {}).get("content", "").strip().lower()
-            if label in ("sql", "rag", "chat"):
+            if label in ("asx", "sql", "rag", "chat"):
                 return label
         except Exception:
             pass  # fall through to heuristic
 
         # Keyword heuristic
+        if self._ASX_KEYWORDS.search(message):
+            return "asx"
         if self._SQL_KEYWORDS.search(message):
             return "sql"
         if self._RAG_KEYWORDS.search(message):
@@ -397,6 +510,140 @@ class Pipeline:
                 uri  = src.get("source_uri", "")
                 lines.append(f"- **{name}** [{coll}]  `{uri}`")
             yield "\n".join(lines)
+
+    def _route_asx(self, message: str, ticker: Optional[str]) -> str:
+        """
+        Route ASX-related questions to the RAG API's /v1/asx/* endpoints.
+
+        Intent detection (within the ASX route):
+          - "fetch"/"list"/"show"  → /v1/asx/announcements
+          - "ingest"/"save"        → /v1/asx/ingest
+          - everything else        → /v1/asx/interpret (default)
+
+        Ticker is taken from the explicit ASX tag if present;
+        otherwise extracted from the first uppercase word in the message.
+        """
+        # Resolve ticker from message if not already extracted by tag
+        if not ticker:
+            ticker = self._extract_ticker(message)
+
+        if not ticker:
+            return (
+                "⚠️ I detected an ASX-related question but couldn't identify a ticker symbol.\n\n"
+                "Try: `What did BHP announce?` or `ASX:CBA interpret`"
+            )
+
+        headers = {"Content-Type": "application/json"}
+        if self.valves.DATAPAI_RAG_API_KEY:
+            headers["Authorization"] = f"Bearer {self.valves.DATAPAI_RAG_API_KEY}"
+
+        base_url = self.valves.DATAPAI_RAG_API_URL
+
+        # Detect sub-intent
+        if re.search(r"\b(ingest|save|store|add to knowledge|embed)\b", message, re.IGNORECASE):
+            # Ingest path
+            try:
+                r = requests.post(
+                    f"{base_url}/v1/asx/ingest",
+                    json={
+                        "ticker":                ticker,
+                        "count":                 self.valves.ASX_DEFAULT_COUNT,
+                        "market_sensitive_only": self.valves.ASX_MARKET_SENSITIVE,
+                    },
+                    headers=headers,
+                    timeout=300,
+                )
+                r.raise_for_status()
+                d = r.json()
+                return (
+                    f"## 📥 Ingested {ticker} Announcements\n\n"
+                    f"| Status | Count |\n|--------|-------|\n"
+                    f"| ✅ Ingested | {d.get('ingested', 0)} |\n"
+                    f"| ⏭ Skipped  | {d.get('skipped',  0)} |\n"
+                    f"| ❌ Errors   | {d.get('errors',   0)} |\n\n"
+                    f"Now searchable via the **DataPAI RAG** pipeline."
+                )
+            except Exception as exc:
+                return f"⚠️ Ingest failed for **{ticker}**: `{exc}`"
+
+        elif re.search(r"\b(fetch|list|show|recent|latest announcements?|history)\b", message, re.IGNORECASE):
+            # Fetch list path
+            count_m = re.search(r"\b(\d+)\b", message)
+            count   = int(count_m.group(1)) if count_m else self.valves.ASX_DEFAULT_COUNT
+            try:
+                r = requests.post(
+                    f"{base_url}/v1/asx/announcements",
+                    json={
+                        "ticker":                ticker,
+                        "count":                 count,
+                        "market_sensitive_only": self.valves.ASX_MARKET_SENSITIVE,
+                    },
+                    headers=headers,
+                    timeout=20,
+                )
+                r.raise_for_status()
+                d    = r.json()
+                anns = d.get("announcements", [])
+                if not anns:
+                    return f"No announcements found for **{ticker}**."
+
+                lines = [
+                    f"## 📈 {ticker} — Recent Announcements\n",
+                    "| # | Date | Headline | Type | 🔴 |",
+                    "|---|------|----------|------|----|",
+                ]
+                for i, a in enumerate(anns, 1):
+                    date = (a.get("document_date") or "")[:10]
+                    hl   = (a.get("headline") or "—")[:65]
+                    dt   = a.get("doc_type", "—")
+                    s    = "🔴" if a.get("market_sensitive") else ""
+                    lines.append(f"| {i} | {date} | {hl} | {dt} | {s} |")
+                lines.append(f"\n💡 Ask: `interpret {ticker}` for an AI analysis.")
+                return "\n".join(lines)
+            except Exception as exc:
+                return f"⚠️ Failed to fetch announcements for **{ticker}**: `{exc}`"
+
+        else:
+            # Default: interpret latest announcement
+            question = None
+            clean = re.sub(r"\b" + re.escape(ticker) + r"\b", "", message, flags=re.IGNORECASE).strip()
+            clean = re.sub(r"\b(asx|announce|interpret|analyse|analyze|results?|report)\b", "", clean, flags=re.IGNORECASE).strip()
+            clean = re.sub(r"\s+", " ", clean).strip()
+            if len(clean) > 8:
+                question = clean
+
+            try:
+                r = requests.post(
+                    f"{base_url}/v1/asx/interpret",
+                    json={"ticker": ticker, "question": question, "max_doc_chars": 8000},
+                    headers=headers,
+                    timeout=120,
+                )
+                r.raise_for_status()
+                d = r.json()
+            except requests.exceptions.ConnectionError:
+                return (
+                    f"⚠️ RAG API not reachable at `{base_url}`.\n"
+                    f"Please start the service on EC2 #2."
+                )
+            except Exception as exc:
+                return f"⚠️ Interpretation failed for **{ticker}**: `{exc}`"
+
+            headline = d.get("headline", "—")
+            date     = (d.get("date") or "")[:10]
+            source   = d.get("source_url", "")
+            interp   = d.get("interpretation", "No interpretation returned.")
+            q_note   = f" — *\"{question}\"*" if question else ""
+
+            lines = [
+                f"## 📊 {ticker} — {date}{q_note}",
+                f"**{headline}**\n",
+                interp,
+                "\n---",
+                f"📎 **Source:** [{headline[:55]}]({source})" if source else "",
+                "🤖 **LLM chain:** Gemini flash-lite → GPT-5.1 reviewer",
+            ]
+            return "\n".join(l for l in lines if l)
 
     def _route_chat(
         self,

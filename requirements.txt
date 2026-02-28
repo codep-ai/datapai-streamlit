@@ -18,6 +18,8 @@ opencv-python
 code_editor
 unstructured_inference
 pikepdf
+pdfplumber
+yfinance        # ASX price data (OHLCV) for trading signals — pure pandas indicators, no ta-lib
 
 # AG2 ETL agents
 ag2
