@@ -82,7 +82,7 @@ def run_ai_agents():
 
     _render_budget_sidebar()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "Run SQL",
         "dbt Agent",
         "Knowledge Ingest Agent",
@@ -91,6 +91,7 @@ def run_ai_agents():
         "Airbyte Sync",
         "Workflow (Ingest → dbt)",
         "ASX Announcements",
+        "📊 Technical Analysis",
     ])
 
     with tab1:
@@ -768,3 +769,169 @@ def run_ai_agents():
                     st.session_state.asx_chat_history.append(
                         {"role": "assistant", "content": answer}
                     )
+
+    # ── Tab 9: Standalone Technical Analysis ────────────────────────────────────
+    with tab9:
+        st.header("📊 Technical Analysis")
+        st.caption(
+            "Live multi-timeframe price analysis powered by Yahoo Finance. "
+            "Works independently — no ASX announcement required."
+        )
+        st.error(
+            "⚠️ **NOT FINANCIAL ADVICE** — AI-generated analysis for informational "
+            "and educational purposes only. Always consult a licensed financial adviser "
+            "before making any investment decision.",
+            icon="⚠️",
+        )
+
+        # ── Inputs ───────────────────────────────────────────────────────────
+        col_ticker, col_suffix, col_btn = st.columns([3, 2, 1])
+
+        with col_ticker:
+            ta_ticker = st.text_input(
+                "Ticker symbol",
+                value="BHP",
+                placeholder="e.g. BHP, CBA, AAPL, BP",
+                key="ta_ticker",
+                help="Enter a bare ticker. The exchange suffix is set separately.",
+            ).strip().upper()
+
+        with col_suffix:
+            suffix_options = {
+                "ASX (.AX)":       ".AX",
+                "NYSE / NASDAQ":   "",
+                "London (.L)":     ".L",
+                "Toronto (.TO)":   ".TO",
+                "Hong Kong (.HK)": ".HK",
+                "Custom…":         "__custom__",
+            }
+            suffix_choice = st.selectbox(
+                "Exchange",
+                list(suffix_options.keys()),
+                index=0,
+                key="ta_suffix_choice",
+            )
+            if suffix_choice == "Custom…":
+                ta_suffix = st.text_input(
+                    "Custom suffix (e.g. .SI, .DE)",
+                    value=".AX",
+                    key="ta_suffix_custom",
+                ).strip()
+            else:
+                ta_suffix = suffix_options[suffix_choice]
+
+        with col_btn:
+            st.write("")  # vertical alignment nudge
+            st.write("")
+            analyse_btn = st.button("🔍 Analyse", key="ta_analyse_btn", use_container_width=True)
+
+        ta_question = st.text_input(
+            "Optional: specific question for the AI signal",
+            value="",
+            placeholder="e.g. Is a breakout forming? What are the key support levels?",
+            key="ta_question",
+        ).strip() or None
+
+        # Timeframe multi-select
+        tf_labels = {"5m": "5-Minute", "30m": "30-Minute", "1h": "1-Hour", "1d": "Daily"}
+        ta_timeframes = st.multiselect(
+            "Timeframes to include",
+            options=list(tf_labels.keys()),
+            default=["5m", "30m", "1h", "1d"],
+            format_func=lambda x: tf_labels[x],
+            key="ta_timeframes",
+        )
+        if not ta_timeframes:
+            ta_timeframes = ["1d"]
+
+        # ── Run analysis ─────────────────────────────────────────────────────
+        if analyse_btn and ta_ticker:
+            from agents.technical_analysis import (
+                fetch_all_timeframes,
+                build_technical_context,
+                generate_technical_signal,
+            )
+
+            yf_symbol = f"{ta_ticker}{ta_suffix}"
+
+            with st.spinner(f"Fetching price data for {yf_symbol} across {len(ta_timeframes)} timeframe(s)…"):
+                indicators_by_tf = fetch_all_timeframes(
+                    ta_ticker,
+                    suffix=ta_suffix,
+                    timeframes=tuple(ta_timeframes),
+                )
+
+            available = [tf for tf, v in indicators_by_tf.items() if v is not None]
+
+            if not available:
+                st.warning(
+                    f"⚠️ No price data found for **{yf_symbol}**. "
+                    "Check the ticker symbol and exchange suffix. "
+                    "Yahoo Finance may also be rate-limiting — wait 30 seconds and retry."
+                )
+                st.session_state["ta_indicators"] = None
+                st.session_state["ta_context"]    = None
+                st.session_state["ta_signal"]     = None
+                st.session_state["ta_symbol"]     = yf_symbol
+            else:
+                st.success(f"✅ Price data loaded for: **{', '.join(available)}**")
+
+                # Build and cache context + signal
+                ctx = build_technical_context(ta_ticker, indicators_by_tf, suffix=ta_suffix)
+                st.session_state["ta_indicators"] = indicators_by_tf
+                st.session_state["ta_context"]    = ctx
+                st.session_state["ta_symbol"]     = yf_symbol
+                st.session_state["ta_suffix"]     = ta_suffix
+
+                with st.spinner("Generating AI technical signal… (~20–40 s)"):
+                    signal_md = generate_technical_signal(
+                        ta_ticker,
+                        suffix=ta_suffix,
+                        question=ta_question,
+                        timeframes=tuple(ta_timeframes),
+                        indicators_by_tf=indicators_by_tf,
+                    )
+                st.session_state["ta_signal"] = signal_md
+
+        # ── Display results ───────────────────────────────────────────────────
+        if st.session_state.get("ta_context"):
+            st.divider()
+            sym = st.session_state.get("ta_symbol", "")
+            st.subheader(f"📈 Indicator Summary — {sym}")
+            with st.expander("Raw indicator data (all timeframes)", expanded=False):
+                st.code(st.session_state["ta_context"], language=None)
+
+            # Quick snapshot table for available timeframes
+            inds = st.session_state.get("ta_indicators", {})
+            snap_rows = []
+            for tf in ["5m", "30m", "1h", "1d"]:
+                ind = inds.get(tf)
+                if ind is None:
+                    continue
+                snap_rows.append({
+                    "Timeframe": tf_labels.get(tf, tf),
+                    "Price":     f"${ind['current_price']:.4f}",
+                    "Change":    (
+                        f"+{ind['change_pct']}%" if ind.get("change_pct", 0) and ind["change_pct"] >= 0
+                        else (f"{ind['change_pct']}%" if ind.get("change_pct") is not None else "N/A")
+                    ),
+                    "Trend":     ind.get("trend", "N/A"),
+                    "RSI(14)":   str(ind["rsi"]) + f" ({ind['rsi_label']})" if ind.get("rsi") else "N/A",
+                    "MACD":      ind.get("macd_label", "N/A"),
+                    "BB%":       f"{ind['bb_pct']:.2f} — {ind['bb_label']}" if ind.get("bb_pct") is not None else "N/A",
+                    "Vol Ratio": f"{ind['vol_ratio']}×" if ind.get("vol_ratio") else "N/A",
+                })
+
+            if snap_rows:
+                import pandas as pd
+                st.dataframe(pd.DataFrame(snap_rows).set_index("Timeframe"), use_container_width=True)
+
+        if st.session_state.get("ta_signal"):
+            st.divider()
+            sym = st.session_state.get("ta_symbol", "")
+            st.subheader(f"🎯 AI Technical Signal — {sym}")
+            st.markdown(st.session_state["ta_signal"])
+            st.caption(
+                "LLM chain: Gemini flash-lite (draft) → GPT reviewer (compliance + quality gate)  |  "
+                "Data source: Yahoo Finance via yfinance"
+            )
