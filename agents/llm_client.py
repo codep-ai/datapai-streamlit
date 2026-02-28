@@ -6,6 +6,12 @@ import os
 import json
 import requests
 
+# Cost guard — transparent daily budget enforcement for paid LLM APIs.
+# Raises BudgetExceededError before a call when the daily ceiling is reached.
+from agents.cost_guard import CostGuard, BudgetExceededError  # noqa: F401
+
+_guard = CostGuard()   # singleton; reads DAILY_LLM_BUDGET_USD + COST_GUARD_ENABLED from env
+
 # BUGFIX: Strip Markdown code fences for reviewer output
 def _strip_code_fences(text: str) -> str:
     text = text.strip()
@@ -135,6 +141,9 @@ class OpenAIChatClient(BaseChatClient):
         temperature: float = 0.1,
         stream: bool = False,
     ) -> Dict[str, Any]:
+        # ── Budget gate ── raises BudgetExceededError if daily limit reached ──
+        _guard.check(self.model)
+
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
@@ -147,9 +156,19 @@ class OpenAIChatClient(BaseChatClient):
             for chunk in resp:
                 delta = chunk.choices[0].delta
                 full_content += (delta.content or "")
+            # Streaming doesn't expose usage; estimate conservatively
+            _guard.record(self.model, input_tokens=0, output_tokens=len(full_content) // 4)
             return {"role": "assistant", "content": full_content}
         else:
             msg = resp.choices[0].message
+            # Record actual token usage returned by the API
+            usage = getattr(resp, "usage", None)
+            if usage:
+                _guard.record(
+                    self.model,
+                    input_tokens  = getattr(usage, "prompt_tokens",     0),
+                    output_tokens = getattr(usage, "completion_tokens",  0),
+                )
             return {"role": msg.role, "content": msg.content}
 
 # -------------------------
@@ -214,6 +233,9 @@ class GoogleChatClient(BaseChatClient):
             # Your agents don't rely on streaming, so we keep it simple.
             raise NotImplementedError("Streaming not implemented for GoogleChatClient.")
 
+        # ── Budget gate ── raises BudgetExceededError if daily limit reached ──
+        _guard.check(self.model_name)
+
         url = f"{self.base_url}/models/{self.model_name}:generateContent?key={self.api_key}"
 
         payload = {
@@ -234,6 +256,15 @@ class GoogleChatClient(BaseChatClient):
             )
 
         data = resp.json()
+
+        # Record actual token usage from Gemini's usageMetadata field
+        usage = data.get("usageMetadata", {})
+        _guard.record(
+            self.model_name,
+            input_tokens  = usage.get("promptTokenCount",     0),
+            output_tokens = usage.get("candidatesTokenCount", 0),
+        )
+
         # Extract the first candidate's text
         text_parts: List[str] = []
         for cand in data.get("candidates", []):
@@ -359,6 +390,8 @@ class RouterChatClient(BaseChatClient):
     """
 
     def __init__(self):
+        self.llm_enabled = os.environ.get("DATAPAI_LLM_ENABLED", "true").lower() == "true"
+
         mode = os.environ.get("LLM_MODE", "paid").lower()
         if mode not in ("paid", "local", "hybrid"):
             mode = "paid"
@@ -500,6 +533,13 @@ class RouterChatClient(BaseChatClient):
         - If LLM_MODE="hybrid":
             -> try Ollama first, then fall back to cloud primary
         """
+        if not self.llm_enabled:
+            raise RuntimeError(
+                "LLM usage is disabled (DATAPAI_LLM_ENABLED=false). "
+                "Deterministic executor mode enforced."
+            )
+
+        
         if self.mode == "paid":
             draft = self._call_provider(self.primary_provider, messages, temperature, stream)
 

@@ -7,6 +7,8 @@ import duckdb
 from databricks import sql
 from google.oauth2 import service_account
 from google.cloud import bigquery
+from pyathena import connect as athena_connect
+
 
 # Function to connect to Google BigQuery
 def connect_to_bigquery():
@@ -85,6 +87,39 @@ def connect_to_duckdb():
     st.write("Connected to DuckDB")
     return conn
 
+
+def connect_athena():
+    """
+    Connect to Amazon Athena (Iceberg supported).
+    Uses EC2/ECS IAM Role if available — no access keys required.
+    """
+
+    # Lazy import so non-Athena users don't need AWS deps
+    try:
+        from pyathena import connect as athena_connect
+    except ImportError as e:
+        raise ImportError(
+            "PyAthena not installed. Run: pip install 'PyAthena[Arrow]' boto3"
+        ) from e
+
+    s3_staging_dir = st.secrets["ATHENA_S3_STAGING_DIR"]
+    region = st.secrets.get("AWS_REGION", "us-east-1")
+    workgroup = st.secrets.get("ATHENA_WORKGROUP", "primary")
+    schema = st.secrets.get("ATHENA_SCHEMA", "default")
+
+    # IMPORTANT: do NOT pass aws_access_key_id / secret here on EC2
+    # boto3 will use instance role automatically
+    conn = athena_connect(
+        s3_staging_dir=s3_staging_dir,
+        region_name=region,
+        work_group=workgroup,
+        schema_name=schema,
+    )
+
+    return conn
+
+
+
 # Common function to connect to a database based on db_type
 def connect_to_db(db_type):
     #db_type=st.session_state["selected_db"]
@@ -103,6 +138,8 @@ def connect_to_db(db_type):
     elif db_type == "Bigquery":
     #    st.write("Connected to Bigquery")
         return connect_to_bigquery()
+    elif db_type == "Athena":
+        return connect_athena()
     else:
     #    st.write("Unsupported database type")
         return None

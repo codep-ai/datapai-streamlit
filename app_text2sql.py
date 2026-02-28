@@ -22,7 +22,7 @@ def run_text2sql():
     st.title("DataPAI(DATA + AI) - Enterprise Data with AI ")
     st.title("Generate SQL for these databases by AI ")
 
-    db_options = ["Snowflake", "Redshift", "SQLite3", "Bigquery", "DuckDB", "dbt"]
+    db_options = ["Snowflake", "Redshift", "Athena", "SQLite3", "Bigquery", "DuckDB", "dbt"]
     default_db_index = db_options.index("SQLite3")
 
     if 'selected_db' not in st.session_state:
