@@ -147,6 +147,25 @@ class HealthResponse(BaseModel):
     collections: List[str]
 
 
+# ── ASX-specific models ────────────────────────────────────────────────────────
+
+class ASXAnnouncementsRequest(BaseModel):
+    ticker: str
+    count: int = 20
+    market_sensitive_only: bool = False
+
+class ASXInterpretRequest(BaseModel):
+    ticker: str
+    announcement_id: Optional[str] = None   # None → use latest
+    question: Optional[str] = None           # None → auto-summarise
+    max_doc_chars: int = 8000
+
+class ASXIngestRequest(BaseModel):
+    ticker: str
+    count: int = 20
+    market_sensitive_only: bool = False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -471,6 +490,196 @@ def delete_document(filename: str) -> dict:
         raise HTTPException(status_code=404, detail=f"Document '{filename}' not found.")
 
     return {"status": "deleted", "filename": filename, "collections_affected": deleted}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ASX Market Announcement endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/v1/asx/announcements", dependencies=[Depends(_check_api_key)])
+def asx_list_announcements(req: ASXAnnouncementsRequest) -> dict:
+    """
+    Fetch recent announcement metadata for an ASX ticker from the ASX public API.
+
+    Returns the list of announcements — no PDF download, no LLM involved.
+    Fast endpoint (~1-2s) suitable for populating a picker UI or a table.
+    """
+    from agents.asx_announcement_agent import fetch_asx_announcements
+
+    try:
+        announcements = fetch_asx_announcements(
+            req.ticker,
+            count=req.count,
+            market_sensitive_only=req.market_sensitive_only,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("ASX list failed for %s", req.ticker)
+        raise HTTPException(status_code=502, detail=f"ASX API error: {exc}")
+
+    return {
+        "ticker":        req.ticker.upper(),
+        "count":         len(announcements),
+        "announcements": announcements,
+    }
+
+
+@app.post("/v1/asx/interpret", dependencies=[Depends(_check_api_key)])
+def asx_interpret_announcement(req: ASXInterpretRequest) -> dict:
+    """
+    Fetch the latest (or a specific) ASX announcement PDF, extract text,
+    and interpret it via the Gemini flash-lite → GPT-5.1 reviewer LLM chain.
+
+    No vector DB involved — this is the low-latency direct interpretation path.
+
+    Flow:
+      1. Fetch announcement list for the ticker
+      2. Select the target announcement (latest, or by announcement_id)
+      3. Download PDF bytes → extract text with pdfplumber (in-memory)
+      4. Gemini flash-lite generates structured analysis
+      5. GPT-5.1 reviews — returns "APPROVED" or a rewrite
+      6. Return final interpretation + metadata
+
+    Args:
+      ticker:          ASX ticker symbol (e.g. "BHP")
+      announcement_id: Optional; if omitted, the latest announcement is used.
+      question:        Optional; if omitted, auto-generates a structured summary.
+      max_doc_chars:   Max chars of PDF text sent to the LLM (default: 8000).
+    """
+    from agents.asx_announcement_agent import (
+        fetch_asx_announcements,
+        download_pdf_bytes,
+        extract_text_from_pdf_bytes,
+        interpret_announcement,
+    )
+
+    try:
+        announcements = fetch_asx_announcements(req.ticker, count=20)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("ASX fetch failed for %s", req.ticker)
+        raise HTTPException(status_code=502, detail=f"ASX API error: {exc}")
+
+    if not announcements:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No announcements found for ticker '{req.ticker}'.",
+        )
+
+    # Select target announcement
+    if req.announcement_id:
+        ann = next(
+            (a for a in announcements if a.get("id") == req.announcement_id),
+            None,
+        )
+        if ann is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Announcement ID '{req.announcement_id}' not found for {req.ticker}.",
+            )
+    else:
+        ann = announcements[0]   # latest
+
+    pdf_url = ann.get("url", "")
+    if not pdf_url:
+        raise HTTPException(status_code=502, detail="No PDF URL found for this announcement.")
+
+    try:
+        pdf_bytes = download_pdf_bytes(pdf_url)
+        pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+    except Exception as exc:
+        logger.exception("PDF download/extract failed for %s", pdf_url)
+        raise HTTPException(status_code=502, detail=f"PDF processing error: {exc}")
+
+    try:
+        interpretation = interpret_announcement(
+            ann,
+            pdf_text,
+            question=req.question,
+            max_doc_chars=req.max_doc_chars,
+        )
+    except Exception as exc:
+        logger.exception("LLM interpretation failed for %s", req.ticker)
+        raise HTTPException(status_code=500, detail=f"LLM error: {exc}")
+
+    return {
+        "ticker":         req.ticker.upper(),
+        "announcement_id": ann.get("id", ""),
+        "headline":       ann.get("headline", ""),
+        "date":           (ann.get("document_date") or "")[:10],
+        "doc_type":       ann.get("doc_type", ""),
+        "source_url":     pdf_url,
+        "market_sensitive": ann.get("market_sensitive", False),
+        "text_extracted": bool(pdf_text.strip()),
+        "interpretation": interpretation,
+        "reviewed":       True,    # Gemini→GPT chain always runs
+        "question":       req.question,
+    }
+
+
+@app.post("/v1/asx/ingest", dependencies=[Depends(_check_api_key)])
+def asx_ingest_announcements(req: ASXIngestRequest) -> dict:
+    """
+    Fetch recent ASX announcements for a ticker and bulk-ingest them into LanceDB.
+
+    This is the knowledge-base path: after ingestion, announcements are searchable
+    via the standard RAG endpoints (/v1/rag/retrieve, /v1/rag/query).
+
+    De-duplication: announcements already in LanceDB are skipped automatically.
+
+    Returns a summary of ingested / skipped / errored documents.
+    """
+    from agents.asx_announcement_agent import (
+        fetch_asx_announcements,
+        download_pdf_bytes,
+        extract_text_from_pdf_bytes,
+        ingest_announcement_to_lancedb,
+    )
+
+    db_uri = os.getenv("LANCEDB_URI", "s3://codepais3/lancedb_data/")
+
+    try:
+        announcements = fetch_asx_announcements(
+            req.ticker,
+            count=req.count,
+            market_sensitive_only=req.market_sensitive_only,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.exception("ASX fetch failed for %s", req.ticker)
+        raise HTTPException(status_code=502, detail=f"ASX API error: {exc}")
+
+    results: List[dict] = []
+    for ann in announcements:
+        pdf_url = ann.get("url", "")
+        try:
+            pdf_bytes = download_pdf_bytes(pdf_url)
+            pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+            result    = ingest_announcement_to_lancedb(ann, pdf_text, db_uri=db_uri)
+            results.append(result)
+        except Exception as exc:
+            logger.warning("Failed to ingest %s: %s", pdf_url, exc)
+            results.append({
+                "status":   "error",
+                "filename": ann.get("id", pdf_url),
+                "reason":   str(exc),
+            })
+
+    ingested = sum(1 for r in results if r.get("status") == "ingested")
+    skipped  = sum(1 for r in results if r.get("status") == "skipped")
+    errors   = sum(1 for r in results if r.get("status") == "error")
+
+    return {
+        "ticker":   req.ticker.upper(),
+        "ingested": ingested,
+        "skipped":  skipped,
+        "errors":   errors,
+        "db_uri":   db_uri,
+        "details":  results,
+    }
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -43,15 +43,15 @@ def _run_sql_via_connector(db_type: str, sql: str) -> Tuple[Optional[pd.DataFram
 def run_ai_agents():
     st.title("🤖 Data P AI Agent Hub")
 
-    # MOD: added tab7
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "Run SQL",
         "dbt Agent",
         "Knowledge Ingest Agent",
         "Ingest File",
         "DLT Ingest",
         "Airbyte Sync",
-        "Workflow (Ingest → dbt)"  # NEW: canonical workflow tab
+        "Workflow (Ingest → dbt)",
+        "ASX Announcements",
     ])
 
     with tab1:
@@ -425,3 +425,237 @@ def run_ai_agents():
 
             except Exception as e:
                 st.error(f"Workflow failed: {e}")
+
+    # ── Tab 8: ASX Market Announcements ────────────────────────────────────────
+    with tab8:
+        st.header("📈 ASX Market Announcements")
+        st.caption(
+            "Fetch and interpret ASX announcements in real-time — no manual PDF upload needed. "
+            "Use **Quick Interpret** for instant LLM analysis, or **Ingest** to add to the knowledge base for RAG."
+        )
+
+        # ── Session state init ──────────────────────────────────────────────
+        for _key, _default in {
+            "asx_announcements":  [],
+            "asx_pdf_cache":      {},   # {url: pdf_text}
+            "asx_interpretation": "",
+            "asx_selected_idx":   0,
+            "asx_chat_history":   [],
+        }.items():
+            if _key not in st.session_state:
+                st.session_state[_key] = _default
+
+        # ── Controls ────────────────────────────────────────────────────────
+        ctrl_col, _ = st.columns([2, 1])
+        with ctrl_col:
+            tickers_input = st.text_input(
+                "ASX Ticker(s)",
+                placeholder="e.g.  BHP, CBA, RIO",
+                help="Enter one or more ASX ticker symbols separated by commas.",
+                key="asx_ticker_input",
+            )
+            ann_count = st.slider(
+                "Number of announcements per ticker", 5, 50, 20, key="asx_count"
+            )
+            ms_only = st.checkbox(
+                "Market-sensitive only", key="asx_ms_only",
+                help="Tick to return only announcements flagged as market-sensitive."
+            )
+
+        fetch_btn = st.button("🔍 Fetch Announcements", key="asx_fetch")
+
+        if fetch_btn and tickers_input.strip():
+            from agents.asx_announcement_agent import fetch_asx_announcements as _fetch
+
+            tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
+            all_anns: list = []
+            for ticker in tickers:
+                with st.spinner(f"Fetching announcements for {ticker}…"):
+                    try:
+                        fetched = _fetch(ticker, count=ann_count, market_sensitive_only=ms_only)
+                        all_anns.extend(fetched)
+                        st.success(f"✅ {ticker}: {len(fetched)} announcement(s) fetched")
+                    except Exception as exc:
+                        st.error(f"❌ {ticker}: {exc}")
+
+            st.session_state.asx_announcements  = all_anns
+            st.session_state.asx_interpretation = ""
+            st.session_state.asx_chat_history   = []
+            st.session_state.asx_selected_idx   = 0
+
+        # ── Announcements table + actions ───────────────────────────────────
+        if st.session_state.asx_announcements:
+            anns = st.session_state.asx_announcements
+
+            df_display = pd.DataFrame([{
+                "Ticker":    a["ticker"],
+                "Date":      (a["document_date"] or "")[:10],
+                "Headline":  a["headline"],
+                "Type":      a["doc_type"],
+                "Pages":     a["number_of_pages"],
+                "Size KB":   a["size_kb"],
+                "Sensitive": "🔴" if a["market_sensitive"] else "",
+            } for a in anns])
+
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # Announcement selector
+            headline_options = [
+                f"{a['ticker']} | {(a['document_date'] or '')[:10]} | {a['headline'][:70]}"
+                for a in anns
+            ]
+            selected_label = st.selectbox(
+                "Select announcement to act on",
+                headline_options,
+                index=min(st.session_state.asx_selected_idx, len(headline_options) - 1),
+                key="asx_select",
+            )
+            selected_idx = headline_options.index(selected_label)
+            selected_ann = anns[selected_idx]
+
+            # Per-announcement action buttons
+            act_col1, act_col2, act_col3 = st.columns(3)
+
+            with act_col1:
+                if st.button("⚡ Quick Interpret (direct LLM)", key="asx_interpret"):
+                    from agents.asx_announcement_agent import (
+                        download_pdf_bytes,
+                        extract_text_from_pdf_bytes,
+                        interpret_announcement,
+                    )
+                    pdf_url = selected_ann.get("url", "")
+                    with st.spinner("Downloading PDF and interpreting…"):
+                        try:
+                            if pdf_url not in st.session_state.asx_pdf_cache:
+                                pdf_bytes = download_pdf_bytes(pdf_url)
+                                pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+                                st.session_state.asx_pdf_cache[pdf_url] = pdf_text
+                            else:
+                                pdf_text = st.session_state.asx_pdf_cache[pdf_url]
+
+                            interpretation = interpret_announcement(selected_ann, pdf_text)
+                            st.session_state.asx_interpretation = interpretation
+                            st.session_state.asx_chat_history   = []
+                            st.session_state.asx_selected_idx   = selected_idx
+                        except Exception as exc:
+                            st.error(f"Interpretation failed: {exc}")
+
+            with act_col2:
+                if st.button("📥 Ingest to Knowledge Base", key="asx_ingest_one"):
+                    from agents.asx_announcement_agent import (
+                        download_pdf_bytes,
+                        extract_text_from_pdf_bytes,
+                        ingest_announcement_to_lancedb,
+                    )
+                    pdf_url = selected_ann.get("url", "")
+                    db_uri  = os.environ.get("LANCEDB_URI", "s3://codepais3/lancedb_data/")
+                    with st.spinner("Downloading and ingesting to LanceDB…"):
+                        try:
+                            if pdf_url not in st.session_state.asx_pdf_cache:
+                                pdf_bytes = download_pdf_bytes(pdf_url)
+                                pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+                                st.session_state.asx_pdf_cache[pdf_url] = pdf_text
+                            else:
+                                pdf_text = st.session_state.asx_pdf_cache[pdf_url]
+
+                            result = ingest_announcement_to_lancedb(
+                                selected_ann, pdf_text, db_uri=db_uri
+                            )
+                            if result["status"] == "ingested":
+                                st.success(f"✅ Ingested: {result['filename']}")
+                            else:
+                                st.info(f"ℹ️ {result.get('reason', 'Already ingested')}")
+                        except Exception as exc:
+                            st.error(f"Ingest failed: {exc}")
+
+            with act_col3:
+                if st.button("📦 Ingest ALL to Knowledge Base", key="asx_ingest_all"):
+                    from agents.asx_announcement_agent import (
+                        download_pdf_bytes,
+                        extract_text_from_pdf_bytes,
+                        ingest_announcement_to_lancedb,
+                    )
+                    db_uri  = os.environ.get("LANCEDB_URI", "s3://codepais3/lancedb_data/")
+                    results = []
+                    prog    = st.progress(0, "Ingesting…")
+                    for i, ann in enumerate(anns):
+                        pdf_url = ann.get("url", "")
+                        try:
+                            if pdf_url not in st.session_state.asx_pdf_cache:
+                                pdf_bytes = download_pdf_bytes(pdf_url)
+                                pdf_text  = extract_text_from_pdf_bytes(pdf_bytes)
+                                st.session_state.asx_pdf_cache[pdf_url] = pdf_text
+                            else:
+                                pdf_text = st.session_state.asx_pdf_cache[pdf_url]
+
+                            res = ingest_announcement_to_lancedb(ann, pdf_text, db_uri=db_uri)
+                            results.append(res)
+                        except Exception as exc:
+                            results.append({
+                                "status":   "error",
+                                "filename": pdf_url,
+                                "reason":   str(exc),
+                            })
+                        prog.progress(
+                            (i + 1) / len(anns),
+                            f"Processing {i + 1}/{len(anns)}: {ann.get('headline', '')[:50]}"
+                        )
+
+                    ingested = sum(1 for r in results if r["status"] == "ingested")
+                    skipped  = sum(1 for r in results if r["status"] == "skipped")
+                    errors   = sum(1 for r in results if r["status"] == "error")
+                    st.success(
+                        f"Done — ✅ ingested: {ingested}, "
+                        f"⏭ skipped: {skipped}, "
+                        f"❌ errors: {errors}"
+                    )
+
+            # ── Interpretation display + follow-up chat ─────────────────────
+            if st.session_state.asx_interpretation:
+                st.divider()
+                ann = anns[st.session_state.asx_selected_idx]
+                st.subheader(
+                    f"📊 {ann['ticker']} — {(ann['document_date'] or '')[:10]}"
+                )
+                st.caption(ann["headline"])
+                st.markdown(st.session_state.asx_interpretation)
+
+                st.divider()
+                st.subheader("💬 Follow-up Questions")
+
+                for msg in st.session_state.asx_chat_history:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+
+                follow_up = st.chat_input(
+                    "Ask a follow-up about this announcement…",
+                    key="asx_chat_input",
+                )
+                if follow_up and follow_up.strip():
+                    from agents.asx_announcement_agent import interpret_announcement
+
+                    st.session_state.asx_chat_history.append(
+                        {"role": "user", "content": follow_up}
+                    )
+                    with st.chat_message("user"):
+                        st.markdown(follow_up)
+
+                    ref_ann  = anns[st.session_state.asx_selected_idx]
+                    pdf_url  = ref_ann.get("url", "")
+                    pdf_text = st.session_state.asx_pdf_cache.get(pdf_url, "")
+
+                    with st.chat_message("assistant"):
+                        with st.spinner("Thinking…"):
+                            try:
+                                answer = interpret_announcement(
+                                    ref_ann, pdf_text, question=follow_up
+                                )
+                            except Exception as exc:
+                                answer = f"⚠️ Error: {exc}"
+                        st.markdown(answer)
+
+                    st.session_state.asx_chat_history.append(
+                        {"role": "assistant", "content": answer}
+                    )
