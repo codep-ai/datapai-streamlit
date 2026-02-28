@@ -227,37 +227,73 @@ class GoogleChatClient(BaseChatClient):
         messages: List[Dict[str, str]],
         temperature: float = 0.1,
         stream: bool = False,
+        grounding: bool = False,
     ) -> Dict[str, Any]:
+        """
+        Call the Gemini API.
+
+        Parameters (additions over base class)
+        ---------------------------------------
+        grounding : bool
+            Enable Google Search grounding (Gemini 2.x+).
+            When True, Gemini can search Google for real-time news, analyst
+            ratings, and market sentiment to supplement any context we inject.
+
+            This is the DataPAI hybrid approach:
+              • We inject deterministically computed indicators (RSI, MACD, BB,
+                EMAs) — exact values from live OHLCV data, not LLM guesses.
+              • Gemini grounding adds real-time qualitative context (news,
+                analyst consensus, recent corporate events) that we can't
+                compute ourselves.
+            Together these are strictly better than asking Gemini alone.
+
+            If the model returns HTTP 400 (grounding not supported), the call
+            is automatically retried without grounding — no crash, just a log.
+
+            When grounding is active the returned dict gains extra keys:
+              grounding_sources  : List[{"title": str, "uri": str}]
+              web_search_queries : List[str]
+        """
         if stream:
-            # For now, we don't implement streaming via HTTP in this client.
-            # Your agents don't rely on streaming, so we keep it simple.
             raise NotImplementedError("Streaming not implemented for GoogleChatClient.")
 
-        # ── Budget gate ── raises BudgetExceededError if daily limit reached ──
+        # ── Budget gate ────────────────────────────────────────────────────────
         _guard.check(self.model_name)
 
         url = f"{self.base_url}/models/{self.model_name}:generateContent?key={self.api_key}"
 
-        payload = {
+        payload: Dict[str, Any] = {
             "contents": self._build_contents(messages),
-            "generationConfig": {
-                "temperature": temperature,
-            },
+            "generationConfig": {"temperature": temperature},
         }
+
+        # Gemini 2.x Google Search grounding
+        if grounding:
+            payload["tools"] = [{"googleSearch": {}}]
 
         try:
             resp = requests.post(url, json=payload, timeout=60)
         except Exception as e:
             raise RuntimeError(f"HTTP request to Gemini failed: {e}")
 
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Gemini API error {resp.status_code}: {resp.text}"
+        # Grounding not supported on this model → retry without it silently
+        if grounding and resp.status_code == 400:
+            logger.warning(
+                "Gemini model '%s' does not support googleSearch grounding "
+                "(HTTP 400). Retrying without grounding.", self.model_name
             )
+            payload.pop("tools", None)
+            try:
+                resp = requests.post(url, json=payload, timeout=60)
+            except Exception as e:
+                raise RuntimeError(f"Gemini retry (no grounding) failed: {e}")
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini API error {resp.status_code}: {resp.text}")
 
         data = resp.json()
 
-        # Record actual token usage from Gemini's usageMetadata field
+        # ── Token usage ────────────────────────────────────────────────────────
         usage = data.get("usageMetadata", {})
         _guard.record(
             self.model_name,
@@ -265,17 +301,40 @@ class GoogleChatClient(BaseChatClient):
             output_tokens = usage.get("candidatesTokenCount", 0),
         )
 
-        # Extract the first candidate's text
-        text_parts: List[str] = []
+        # ── Extract text + grounding metadata ─────────────────────────────────
+        text_parts:         List[str]           = []
+        grounding_sources:  List[Dict[str,str]] = []
+        web_search_queries: List[str]           = []
+
         for cand in data.get("candidates", []):
             content = cand.get("content", {})
             for part in content.get("parts", []):
                 if "text" in part:
                     text_parts.append(part["text"])
 
-        final_text = "\n".join(text_parts) if text_parts else ""
+            # Parse groundingMetadata when Google Search was used
+            gm = cand.get("groundingMetadata", {})
+            if gm:
+                for chunk in gm.get("groundingChunks", []):
+                    web = chunk.get("web", {})
+                    if web.get("uri"):
+                        grounding_sources.append({
+                            "title": web.get("title", web["uri"]),
+                            "uri":   web["uri"],
+                        })
+                web_search_queries = gm.get("webSearchQueries", [])
 
-        return {"role": "assistant", "content": final_text}
+        result: Dict[str, Any] = {
+            "role":    "assistant",
+            "content": "\n".join(text_parts) if text_parts else "",
+        }
+
+        # Surface grounding metadata for callers that want to display sources
+        if grounding_sources:
+            result["grounding_sources"]   = grounding_sources
+            result["web_search_queries"]  = web_search_queries
+
+        return result
 
 
 # =============================================================================
