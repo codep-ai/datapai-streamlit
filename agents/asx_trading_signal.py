@@ -32,8 +32,9 @@ from typing import Any, Dict, Optional
 
 # ── All price / indicator logic lives in technical_analysis ──────────────────
 from agents.technical_analysis import (
-    fetch_all_timeframes,          # re-exported for callers that import from here
+    fetch_all_timeframes,           # re-exported for callers that import from here
     build_technical_context,
+    _format_grounding_sources,      # for appending live news sources to the signal
 )
 
 logger = logging.getLogger(__name__)
@@ -173,6 +174,7 @@ def generate_trading_signal(
     pdf_text: str,
     indicators_by_tf: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
     max_doc_chars: int = 6000,
+    use_grounding: bool = True,
 ) -> str:
     """
     Generate a structured ASX trading signal via a two-step LLM chain.
@@ -181,8 +183,16 @@ def generate_trading_signal(
     For a standalone technical signal (no announcement), use:
         agents.technical_analysis.generate_technical_signal()
 
-    Step 1 — Gemini flash-lite: fast structured signal generation (~2–4 s)
-    Step 2 — GPT-5.1 reviewer:  checks consistency, disclaimer presence (~3–8 s)
+    DataPAI hybrid approach
+    -----------------------
+    1. We compute exact RSI/MACD/Bollinger/EMA indicators from live OHLCV data.
+    2. We extract announcement text from the PDF.
+    3. Gemini interprets both AND (with use_grounding=True) supplements with
+       real-time news/analyst context via Google Search grounding.
+    4. GPT reviews for compliance and arithmetic correctness.
+
+    Step 1 — Gemini (primary, grounded): fast signal + live news (~5–15 s)
+    Step 2 — GPT-5.1 reviewer: compliance + quality gate (~3–8 s)
 
     Parameters
     ----------
@@ -191,6 +201,8 @@ def generate_trading_signal(
     indicators_by_tf: result of fetch_all_timeframes(), or None to skip price data.
                       If None is passed, signal is based on announcement text only.
     max_doc_chars   : truncation limit for the announcement text
+    use_grounding   : enable Gemini Google Search grounding for real-time news
+                      and analyst context (default True)
 
     Returns
     -------
@@ -245,10 +257,23 @@ def generate_trading_signal(
         {"role": "user",   "content": user_msg},
     ]
 
-    # ── Step 1: Gemini flash-lite (primary, fast) ────────────────────────────
+    # ── Step 1: Gemini (primary, grounded) ───────────────────────────────────
+    # Injects our deterministic indicators + optional real-time news via Search
     try:
-        gemini = GoogleChatClient()
-        draft  = gemini.chat(messages, temperature=0.2).get("content", "")
+        gemini      = GoogleChatClient()
+        gemini_resp = gemini.chat(messages, temperature=0.2, grounding=use_grounding)
+        draft       = gemini_resp.get("content", "")
+
+        # Append live news sources footnote if Gemini retrieved grounding results
+        grounding_sources = gemini_resp.get("grounding_sources", [])
+        grounding_queries = gemini_resp.get("web_search_queries", [])
+        if grounding_sources:
+            draft += _format_grounding_sources(grounding_sources, grounding_queries)
+            logger.info(
+                "Gemini grounding active for %s — %d source(s)",
+                ticker, len(grounding_sources),
+            )
+
     except Exception as exc:
         logger.warning("Gemini signal generation failed, falling back to GPT: %s", exc)
         try:

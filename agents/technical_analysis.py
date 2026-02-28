@@ -10,21 +10,33 @@ Can be called:
   • Via REST API:  POST /v1/technical/signal  {"ticker": "BHP", "suffix": ".AX"}
   • Directly:      python -m agents.technical_analysis BHP
 
-Supported exchanges (via yfinance suffix):
+Supported exchanges (via data provider suffix):
   .AX  — ASX (Australian Securities Exchange)       e.g. BHP.AX
   ""   — NYSE / NASDAQ                              e.g. AAPL, MSFT
   .L   — London Stock Exchange                      e.g. BP.L
   .TO  — Toronto Stock Exchange (TSX)               e.g. TD.TO
   .HK  — Hong Kong Stock Exchange (HKEX)            e.g. 0700.HK
-  (set suffix="" for US markets; pass any other suffix for other exchanges)
+
+Data sources (pluggable via `source` parameter):
+  "yahoo"   — Yahoo Finance (yfinance).  Free, default.  Best for ASX/US.
+  "eodhd"   — EOD Historical Data.  Paid.  Better ASX intraday depth.
+  "polygon" — Polygon.io.  Paid.  US stocks only.
+
+Gemini grounding:
+  When use_grounding=True (default), Gemini searches Google for real-time news,
+  analyst ratings, and market sentiment to supplement our computed indicators.
+  This is the DataPAI edge: deterministic math (RSI/MACD/BB/EMAs we compute)
+  + live qualitative context (news/sentiment Gemini retrieves).
 
 Architecture
 ------------
-  fetch_ohlcv(ticker, timeframe, suffix)  →  pd.DataFrame | None
-  calc_indicators(df)                     →  dict of indicators
-  fetch_all_timeframes(ticker, suffix)    →  {tf: indicator_dict | None}
-  build_technical_context(ticker, data)   →  formatted str for LLM injection
-  generate_technical_signal(ticker, ...)  →  Markdown signal string (standalone)
+  fetch_ohlcv(ticker, timeframe, suffix, source)   →  pd.DataFrame | None
+  calc_indicators(df)                               →  dict of indicators
+  fetch_all_timeframes(ticker, suffix, source)      →  {tf: indicator_dict | None}
+  build_technical_context(ticker, data)             →  formatted str for LLM injection
+  _format_grounding_sources(sources, queries)       →  markdown footnote block
+  generate_technical_signal(ticker, ..., source,
+                             use_grounding)         →  Markdown signal string
 
 ⚠️  All signals are AI-generated for INFORMATIONAL AND EDUCATIONAL PURPOSES
     ONLY.  They are NOT financial advice.
@@ -33,6 +45,7 @@ Dependencies
 ------------
   pip install yfinance    (already in requirements.txt)
   pandas                  (already present)
+  agents.data_providers   (pluggable OHLCV provider registry)
 """
 
 from __future__ import annotations
@@ -45,14 +58,12 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Timeframe configuration
+# Timeframe configuration — canonical metadata shared by all providers
 # ---------------------------------------------------------------------------
 
-# Maps timeframe code → yfinance params.
-# period limits enforced by Yahoo Finance:
-#   5m, 15m, 30m  → max 60 days
-#   1h            → max 730 days
-#   1d, 1wk, 1mo  → unlimited
+# bars  : how many bars to keep after fetch (tail limit)
+# label : human-readable label used in context formatter and UI
+# interval/period : used by Yahoo provider internally; other providers translate
 _TF_CONFIG: Dict[str, Dict[str, Any]] = {
     "5m":  {"interval": "5m",  "period": "5d",  "bars": 120, "label": "5-Minute"},
     "30m": {"interval": "30m", "period": "30d", "bars": 120, "label": "30-Minute"},
@@ -71,15 +82,18 @@ def fetch_ohlcv(
     ticker: str,
     timeframe: str = "1d",
     suffix: str = ".AX",
+    source: str = "yahoo",
 ) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV bars for a ticker from Yahoo Finance.
+    Fetch OHLCV bars for a ticker from the chosen data provider.
 
     Parameters
     ----------
     ticker    : bare ticker symbol (e.g. "BHP", "AAPL", "BP")
     timeframe : one of "5m" | "30m" | "1h" | "1d"
-    suffix    : exchange suffix to append (e.g. ".AX" for ASX, "" for US)
+    suffix    : exchange suffix (e.g. ".AX" for ASX, "" for US)
+    source    : data provider — "yahoo" (default) | "eodhd" | "polygon"
+                Gracefully falls back to Yahoo if the provider has no API key.
 
     Returns
     -------
@@ -87,59 +101,9 @@ def fetch_ohlcv(
     or None if the fetch fails for any reason (network, unknown ticker,
     insufficient history, etc.).  Never raises — all errors are logged.
     """
-    try:
-        import yfinance as yf
-    except ImportError:
-        logger.error("yfinance not installed.  Run: pip install yfinance")
-        return None
-
-    cfg      = _TF_CONFIG.get(timeframe, _TF_CONFIG["1d"])
-    yf_sym   = f"{ticker.upper().strip()}{suffix}"
-
-    try:
-        df = yf.download(
-            yf_sym,
-            interval    = cfg["interval"],
-            period      = cfg["period"],
-            auto_adjust = True,   # prices are already split/dividend-adjusted
-            prepost     = False,  # exclude pre/post market for intraday bars
-            progress    = False,
-            threads     = False,
-        )
-    except Exception as exc:
-        logger.warning(
-            "yfinance download failed for %s [%s]: %s", yf_sym, timeframe, exc
-        )
-        return None
-
-    if df is None or df.empty:
-        logger.info(
-            "yfinance returned empty DataFrame for %s [%s]", yf_sym, timeframe
-        )
-        return None
-
-    # Flatten MultiIndex columns (yfinance ≥ 0.2 may return them)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing  = [c for c in required if c not in df.columns]
-    if missing:
-        logger.warning(
-            "yfinance response missing columns %s for %s", missing, yf_sym
-        )
-        return None
-
-    df = df[required].dropna(subset=["Close"])
-
-    # Minimum bars guard (need at least 15 for RSI period-14)
-    if len(df) < 15:
-        logger.info(
-            "Insufficient bars (%d) for %s [%s] — skipping", len(df), yf_sym, timeframe
-        )
-        return None
-
-    return df.tail(cfg["bars"])
+    from agents.data_providers import get_provider
+    provider = get_provider(source)
+    return provider.fetch(ticker, timeframe, suffix)
 
 # ---------------------------------------------------------------------------
 # Pure-pandas technical indicators
@@ -330,6 +294,7 @@ def fetch_all_timeframes(
     ticker: str,
     suffix: str = ".AX",
     timeframes: Tuple[str, ...] = DEFAULT_TIMEFRAMES,
+    source: str = "yahoo",
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
     Fetch OHLCV and calculate indicators for multiple timeframes.
@@ -339,18 +304,17 @@ def fetch_all_timeframes(
     ticker     : bare ticker (e.g. "BHP", "AAPL")
     suffix     : exchange suffix (e.g. ".AX", "", ".L")
     timeframes : tuple of timeframe codes to fetch
+    source     : data provider — "yahoo" | "eodhd" | "polygon"
+                 Falls back to Yahoo if the provider has no API key configured.
 
     Returns
     -------
     dict keyed by timeframe code — values are indicator dicts or None
     if data fetch / indicator calculation failed for that timeframe.
-
-    Daily ("1d") is the most reliable timeframe and is always included
-    in DEFAULT_TIMEFRAMES as the baseline fallback.
     """
     result: Dict[str, Optional[Dict[str, Any]]] = {}
     for tf in timeframes:
-        df = fetch_ohlcv(ticker, tf, suffix=suffix)
+        df = fetch_ohlcv(ticker, tf, suffix=suffix, source=source)
         if df is not None:
             try:
                 result[tf] = calc_indicators(df)
@@ -397,7 +361,7 @@ def build_technical_context(
         if ind is None:
             lines.append(
                 f"\n[{label}] DATA UNAVAILABLE "
-                "(yfinance fetch failed or insufficient history)"
+                "(price fetch failed or insufficient history)"
             )
             continue
 
@@ -587,6 +551,58 @@ the fully corrected signal (complete markdown, no preamble).
 
 
 # ---------------------------------------------------------------------------
+# Grounding sources formatter
+# ---------------------------------------------------------------------------
+
+def _format_grounding_sources(
+    sources: List[Dict[str, str]],
+    queries: List[str],
+) -> str:
+    """
+    Format Gemini Google Search grounding metadata into a markdown footnote.
+
+    This block is appended to the AI signal so users can see exactly what
+    real-time web sources Gemini consulted when supplementing our computed
+    indicators with live news / analyst context.
+
+    Parameters
+    ----------
+    sources : list of {"title": str, "uri": str} dicts from groundingChunks
+    queries : list of Google Search queries Gemini issued
+
+    Returns
+    -------
+    Markdown string (starts with newlines so it appends cleanly to signal).
+    Empty string if no sources are present.
+    """
+    if not sources:
+        return ""
+
+    lines = [
+        "\n\n---\n",
+        "### 🌐 Real-Time Sources (Gemini Google Search Grounding)\n",
+    ]
+    if queries:
+        q_str = " · ".join(f'"{q}"' for q in queries)
+        lines.append(f"*Gemini searched for: {q_str}*\n")
+
+    for i, s in enumerate(sources, 1):
+        title = s.get("title") or "Source"
+        uri   = s.get("uri", "")
+        if uri:
+            lines.append(f"{i}. [{title}]({uri})")
+        else:
+            lines.append(f"{i}. {title}")
+
+    lines.append(
+        "\n> *These real-time web results were retrieved by Gemini to supplement "
+        "the deterministically computed technical indicators (RSI, MACD, Bollinger Bands, EMAs). "
+        "Always verify sources independently. NOT financial advice.*"
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Standalone technical signal generation (no announcement required)
 # ---------------------------------------------------------------------------
 
@@ -596,11 +612,22 @@ def generate_technical_signal(
     question: Optional[str] = None,
     timeframes: Tuple[str, ...] = DEFAULT_TIMEFRAMES,
     indicators_by_tf: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
+    source: str = "yahoo",
+    use_grounding: bool = True,
 ) -> str:
     """
     Generate a structured technical trading signal — no announcement required.
 
-    Can be called standalone or as part of a larger pipeline.
+    DataPAI hybrid approach
+    -----------------------
+    1. We compute exact indicators (RSI, MACD, Bollinger, EMAs) from live OHLCV
+       data via the chosen data provider — these are deterministic and auditable.
+    2. Gemini interprets the indicators AND (when use_grounding=True) supplements
+       with real-time news, analyst ratings, and market sentiment via Google Search.
+    3. GPT reviews the draft for compliance and arithmetic correctness.
+
+    This is strictly better than asking Gemini directly: Gemini's native search
+    gives approximate/hallucinated indicator values; our computed values are exact.
 
     Parameters
     ----------
@@ -609,6 +636,9 @@ def generate_technical_signal(
     question         : optional specific question (e.g. "Is there a breakout forming?")
     timeframes       : which timeframes to include
     indicators_by_tf : pre-computed indicator dict (skip fetch if already done)
+    source           : data provider — "yahoo" | "eodhd" | "polygon"
+    use_grounding    : enable Gemini Google Search grounding for real-time
+                       news + analyst context (default True)
 
     Returns
     -------
@@ -619,7 +649,9 @@ def generate_technical_signal(
 
     # Fetch price data if not pre-computed
     if indicators_by_tf is None:
-        indicators_by_tf = fetch_all_timeframes(ticker, suffix=suffix, timeframes=timeframes)
+        indicators_by_tf = fetch_all_timeframes(
+            ticker, suffix=suffix, timeframes=timeframes, source=source
+        )
 
     available = [tf for tf, v in indicators_by_tf.items() if v is not None]
 
@@ -627,12 +659,13 @@ def generate_technical_signal(
         return (
             f"> ⚠️ **NOT FINANCIAL ADVICE** — AI-generated for informational purposes only.\n\n"
             f"## 📊 Technical Signal: {ticker}{suffix}\n\n"
-            f"⚠️ **Price data unavailable** — yfinance could not retrieve OHLCV data for "
-            f"`{ticker}{suffix}` across any timeframe.\n\n"
+            f"⚠️ **Price data unavailable** — could not retrieve OHLCV data for "
+            f"`{ticker}{suffix}` via **{source}** across any timeframe.\n\n"
             f"Possible causes:\n"
-            f"- Ticker not found on the exchange (verify the ticker symbol)\n"
-            f"- Network issue reaching Yahoo Finance\n"
-            f"- Lightly traded or recently listed stock with insufficient history\n\n"
+            f"- Ticker not found on the exchange (verify the ticker symbol and suffix)\n"
+            f"- Network issue reaching the data provider\n"
+            f"- Lightly traded or recently listed stock with insufficient history\n"
+            f"- Paid provider API key not set (try source=yahoo as a fallback)\n\n"
             f"Try with an explicit suffix: `BHP.AX`, `AAPL`, `BP.L`"
         )
 
@@ -672,10 +705,24 @@ def generate_technical_signal(
         {"role": "user",   "content": user_msg},
     ]
 
-    # ── Step 1: Gemini flash-lite (fast primary) ──────────────────────────────
+    # ── Step 1: Gemini (primary) — indicators we computed + optional live news ──
+    # DataPAI hybrid: we inject exact RSI/MACD/BB/EMA values, Gemini interprets
+    # AND (with grounding=True) searches Google for real-time news + analyst data.
     try:
         gemini = GoogleChatClient()
-        draft  = gemini.chat(messages, temperature=0.2).get("content", "")
+        gemini_resp = gemini.chat(messages, temperature=0.2, grounding=use_grounding)
+        draft       = gemini_resp.get("content", "")
+
+        # Append grounding sources footnote if Gemini found live web results
+        grounding_sources = gemini_resp.get("grounding_sources", [])
+        grounding_queries = gemini_resp.get("web_search_queries", [])
+        if grounding_sources:
+            draft += _format_grounding_sources(grounding_sources, grounding_queries)
+            logger.info(
+                "Gemini grounding active for %s%s — %d source(s) retrieved",
+                ticker, suffix, len(grounding_sources),
+            )
+
     except Exception as exc:
         logger.warning(
             "Gemini technical signal failed, falling back to GPT: %s", exc
