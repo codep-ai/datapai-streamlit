@@ -40,8 +40,47 @@ def _run_sql_via_connector(db_type: str, sql: str) -> Tuple[Optional[pd.DataFram
 # Exported entry point
 # ------------------------------
 
+def _render_budget_sidebar() -> None:
+    """Show today's LLM API spend vs daily budget in the sidebar."""
+    try:
+        from agents.cost_guard import CostGuard
+        s = CostGuard().status()
+    except Exception:
+        return   # don't crash the app if cost_guard can't load
+
+    if not s.get("enabled", True):
+        st.sidebar.caption("💰 Cost guard disabled")
+        return
+
+    spent     = s["spent_today"]
+    budget    = s["budget_usd"]
+    remaining = s["remaining_usd"]
+    pct       = s["pct_used"]
+    calls     = s["calls_today"]
+
+    st.sidebar.markdown("### 💰 Daily LLM Budget")
+    st.sidebar.progress(min(pct / 100, 1.0))
+
+    col1, col2 = st.sidebar.columns(2)
+    col1.metric("Spent",     f"${spent:.4f}")
+    col2.metric("Remaining", f"${remaining:.4f}")
+
+    status_colour = "🟢" if pct < 75 else ("🟡" if pct < 95 else "🔴")
+    st.sidebar.caption(
+        f"{status_colour} {pct}% of ${budget:.2f} daily budget used "
+        f"· {calls} call{'s' if calls != 1 else ''} today"
+    )
+    if remaining <= 0:
+        st.sidebar.error(
+            "⛔ Daily budget exhausted — paid LLM calls are blocked. "
+            "Increase `DAILY_LLM_BUDGET_USD` or wait until midnight."
+        )
+
+
 def run_ai_agents():
     st.title("🤖 Data P AI Agent Hub")
+
+    _render_budget_sidebar()
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "Run SQL",

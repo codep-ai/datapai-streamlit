@@ -717,6 +717,29 @@ def health_check() -> HealthResponse:
     )
 
 
+# ── Cost / budget status ────────────────────────────────────────────────────────
+
+@app.get("/v1/cost/status")
+def cost_status() -> dict:
+    """
+    Return today's LLM API spend vs the daily budget.
+
+    No auth required — safe to poll from monitoring dashboards or Streamlit.
+
+    Response fields
+    ---------------
+    enabled       : bool   — False means COST_GUARD_ENABLED=false
+    budget_usd    : float  — DAILY_LLM_BUDGET_USD ceiling
+    spent_today   : float  — accumulated paid-API cost so far today (USD)
+    remaining_usd : float  — headroom left (0 when budget exhausted)
+    calls_today   : int    — total paid LLM calls made today
+    date          : str    — YYYY-MM-DD (resets at midnight server time)
+    pct_used      : float  — percentage of daily budget consumed
+    """
+    from agents.cost_guard import CostGuard
+    return CostGuard().status()
+
+
 # ── Dev runner ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
