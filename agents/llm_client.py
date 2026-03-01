@@ -6,9 +6,13 @@ import os
 import json
 import requests
 
+import logging
+
 # Cost guard — transparent daily budget enforcement for paid LLM APIs.
 # Raises BudgetExceededError before a call when the daily ceiling is reached.
 from agents.cost_guard import CostGuard, BudgetExceededError  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 _guard = CostGuard()   # singleton; reads DAILY_LLM_BUDGET_USD + COST_GUARD_ENABLED from env
 
@@ -335,6 +339,102 @@ class GoogleChatClient(BaseChatClient):
             result["web_search_queries"]  = web_search_queries
 
         return result
+
+
+
+    def chat_vision(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        temperature: float = 0.2,
+    ) -> Dict[str, Any]:
+        """
+        Send a text prompt + image to Gemini Vision (multimodal).
+
+        Uses the same Gemini model as text chat. Requires a multimodal model
+        (Gemini 2.0 Flash or better — not Gemini 1.x).
+
+        Parameters
+        ----------
+        prompt      : analysis instruction for Gemini (what to look for in the image)
+        image_bytes : raw PNG / JPEG bytes to analyse
+        mime_type   : MIME type of the image (default "image/png")
+        temperature : generation temperature (default 0.2)
+
+        Returns
+        -------
+        dict with at least {"role": "assistant", "content": str}
+        Never raises — errors are caught and returned as content strings.
+        """
+        import base64
+
+        # ── Budget gate ────────────────────────────────────────────────────
+        try:
+            _guard.check(self.model_name)
+        except Exception as exc:
+            return {"role": "assistant", "content": f"⚠️ Budget limit reached: {exc}"}
+
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        payload: Dict[str, Any] = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": mime_type, "data": image_b64}},
+                ],
+            }],
+            "generationConfig": {"temperature": temperature},
+        }
+
+        url = (
+            f"{self.base_url}/models/{self.model_name}:generateContent"
+            f"?key={self.api_key}"
+        )
+
+        try:
+            resp = requests.post(url, json=payload, timeout=90)
+        except Exception as exc:
+            logger.warning("Gemini Vision HTTP request failed: %s", exc)
+            return {"role": "assistant", "content": f"⚠️ Gemini Vision request failed: {exc}"}
+
+        if resp.status_code != 200:
+            logger.warning(
+                "Gemini Vision API error %d: %s", resp.status_code, resp.text[:300]
+            )
+            return {
+                "role": "assistant",
+                "content": (
+                    f"⚠️ Gemini Vision API error {resp.status_code}: "
+                    f"{resp.text[:300]}"
+                ),
+            }
+
+        data = resp.json()
+
+        # ── Token accounting ───────────────────────────────────────────────
+        usage = data.get("usageMetadata", {})
+        try:
+            _guard.record(
+                self.model_name,
+                input_tokens  = usage.get("promptTokenCount",     0),
+                output_tokens = usage.get("candidatesTokenCount", 0),
+            )
+        except Exception:
+            pass  # Budget errors are non-fatal here
+
+        # ── Extract text ───────────────────────────────────────────────────
+        text_parts: List[str] = []
+        for cand in data.get("candidates", []):
+            for part in cand.get("content", {}).get("parts", []):
+                if "text" in part:
+                    text_parts.append(part["text"])
+
+        return {
+            "role":    "assistant",
+            "content": "\n".join(text_parts) if text_parts else "(empty response from Gemini Vision)",
+        }
 
 
 # =============================================================================

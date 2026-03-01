@@ -20,6 +20,7 @@ unstructured_inference
 pikepdf
 pdfplumber
 yfinance        # ASX price data (OHLCV) for trading signals — pure pandas indicators, no ta-lib
+matplotlib      # Chart rendering for Vision analysis (agents/chart_vision.py)
 
 # AG2 ETL agents
 ag2
