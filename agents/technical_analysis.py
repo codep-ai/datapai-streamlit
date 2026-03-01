@@ -614,6 +614,7 @@ def generate_technical_signal(
     indicators_by_tf: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
     source: str = "yahoo",
     use_grounding: bool = True,
+    macro_context: str = "",
 ) -> str:
     """
     Generate a structured technical trading signal — no announcement required.
@@ -639,6 +640,11 @@ def generate_technical_signal(
     source           : data provider — "yahoo" | "eodhd" | "polygon"
     use_grounding    : enable Gemini Google Search grounding for real-time
                        news + analyst context (default True)
+    macro_context    : optional sector/macro context string from
+                       agents.market_context.fetch_sector_context() — injected
+                       before technical indicators so the LLM sees sector ETF
+                       performance, commodity prices, and FX rates alongside the
+                       computed indicators
 
     Returns
     -------
@@ -693,8 +699,15 @@ def generate_technical_signal(
         f"Current Price: {'${:.4f}'.format(current_price) if current_price else 'N/A'}",
         f"Timeframes with data: {', '.join(available)}",
         "",
-        tech_context,
     ]
+
+    # Inject sector/macro context (from market_context.py) BEFORE technical
+    # indicators so the LLM frames the stock move in its macro backdrop first.
+    if macro_context and macro_context.strip():
+        user_msg_parts += [macro_context, ""]
+
+    user_msg_parts.append(tech_context)
+
     if question:
         user_msg_parts += ["", f"Specific question: {question}"]
 

@@ -754,6 +754,56 @@ def run_ai_agents():
                     "LLM chain: Gemini flash-lite → GPT-5.1 reviewer"
                 )
 
+                # ── RAG cross-search: find similar past ASX announcements ────
+                with st.expander("🔍 Find Similar Past Announcements in Knowledge Base", expanded=False):
+                    st.caption(
+                        "Semantic search across ingested ASX announcements in the "
+                        "LanceDB vector store — find historical filings with similar "
+                        "content to the current signal."
+                    )
+                    rag_query_asx = (
+                        f"{sig_ann.get('ticker', '')} "
+                        f"{sig_ann.get('headline', '')} "
+                        f"{sig_ann.get('document_type', '')}"
+                    ).strip()
+                    if st.button(
+                        "🔍 Search Knowledge Base",
+                        key="asx_rag_search_btn",
+                        help="Uses vector similarity to find related historical announcements",
+                    ):
+                        with st.spinner("Searching vector store for similar announcements…"):
+                            try:
+                                from agents.knowledge_query_agent import search_lancedb
+                                rag_df = search_lancedb(
+                                    rag_query_asx,
+                                    collections=["asx_announcements"],
+                                    k=5,
+                                )
+                                if rag_df is not None and not rag_df.empty:
+                                    st.success(f"Found {len(rag_df)} similar past announcement(s):")
+                                    for _, row in rag_df.iterrows():
+                                        title   = str(row.get("title",    row.get("headline", "Untitled")))
+                                        snippet = str(row.get("text",     row.get("content",  "")))[:300]
+                                        source  = str(row.get("source",   row.get("url", "")))
+                                        date    = str(row.get("date",     row.get("document_date", "")))[:10]
+                                        with st.container(border=True):
+                                            st.markdown(f"**{title}** — {date}")
+                                            if snippet:
+                                                st.caption(snippet + "…")
+                                            if source:
+                                                st.caption(f"Source: {source}")
+                                else:
+                                    st.info(
+                                        "No similar announcements found in the knowledge base. "
+                                        "Ingest ASX announcements via the RAG tab to build the index."
+                                    )
+                            except Exception as exc:
+                                st.warning(
+                                    f"Knowledge base search unavailable: {exc}. "
+                                    "Ensure LanceDB is configured and the asx_announcements "
+                                    "collection has been ingested."
+                                )
+
             # ── Interpretation display + follow-up chat ─────────────────────
             if st.session_state.asx_interpretation:
                 st.divider()
@@ -995,6 +1045,56 @@ def run_ai_agents():
                         "LLM chain: Gemini (grounded) → GPT reviewer"
                     )
 
+                    # ── RAG cross-search: find similar past SEC filings ───────
+                    with st.expander("🔍 Find Similar Past Filings in Knowledge Base", expanded=False):
+                        st.caption(
+                            "Semantic search across ingested documents in the LanceDB "
+                            "vector store — find historical filings or announcements "
+                            "with similar content to this SEC filing."
+                        )
+                        rag_query_us = (
+                            f"{sig_f.get('ticker', '')} "
+                            f"{sig_f.get('form_type', '')} "
+                            f"{sig_f.get('headline', '')}"
+                        ).strip()
+                        if st.button(
+                            "🔍 Search Knowledge Base",
+                            key="us_rag_search_btn",
+                            help="Vector similarity search across ingested documents",
+                        ):
+                            with st.spinner("Searching vector store for similar filings…"):
+                                try:
+                                    from agents.knowledge_query_agent import search_lancedb
+                                    rag_df_us = search_lancedb(
+                                        rag_query_us,
+                                        collections=["asx_announcements", "documents", "pdfs"],
+                                        k=5,
+                                    )
+                                    if rag_df_us is not None and not rag_df_us.empty:
+                                        st.success(f"Found {len(rag_df_us)} similar document(s):")
+                                        for _, row in rag_df_us.iterrows():
+                                            title   = str(row.get("title",    row.get("headline", "Untitled")))
+                                            snippet = str(row.get("text",     row.get("content",  "")))[:300]
+                                            source  = str(row.get("source",   row.get("url", "")))
+                                            coll    = str(row.get("collection", ""))
+                                            with st.container(border=True):
+                                                st.markdown(f"**{title}**" + (f" [{coll}]" if coll else ""))
+                                                if snippet:
+                                                    st.caption(snippet + "…")
+                                                if source:
+                                                    st.caption(f"Source: {source}")
+                                    else:
+                                        st.info(
+                                            "No similar filings found in the knowledge base. "
+                                            "Ingest SEC filings or ASX announcements via the "
+                                            "RAG tab to build the index."
+                                        )
+                                except Exception as exc:
+                                    st.warning(
+                                        f"Knowledge base search unavailable: {exc}. "
+                                        "Ensure LanceDB is configured and documents have been ingested."
+                                    )
+
                 # ── Interpretation display ───────────────────────────────────
                 if st.session_state.us_interpretation:
                     st.divider()
@@ -1052,13 +1152,9 @@ def run_ai_agents():
                             {"role": "assistant", "content": answer}
                         )
 
-    # ── Tab 9: Standalone Technical Analysis ────────────────────────────────────
+    # ── Tab 9: Technical Analysis (Single Stock + Watchlist Scanner) ─────────────
     with tab9:
         st.header("📊 Technical Analysis")
-        st.caption(
-            "Live multi-timeframe price analysis powered by Yahoo Finance. "
-            "Works independently — no ASX announcement required."
-        )
         st.error(
             "⚠️ **NOT FINANCIAL ADVICE** — AI-generated analysis for informational "
             "and educational purposes only. Always consult a licensed financial adviser "
@@ -1066,154 +1162,513 @@ def run_ai_agents():
             icon="⚠️",
         )
 
-        # ── Inputs ───────────────────────────────────────────────────────────
-        col_ticker, col_suffix, col_btn = st.columns([3, 2, 1])
-
-        with col_ticker:
-            ta_ticker = st.text_input(
-                "Ticker symbol",
-                value="BHP",
-                placeholder="e.g. BHP, CBA, AAPL, BP",
-                key="ta_ticker",
-                help="Enter a bare ticker. The exchange suffix is set separately.",
-            ).strip().upper()
-
-        with col_suffix:
-            suffix_options = {
-                "ASX (.AX)":       ".AX",
-                "NYSE / NASDAQ":   "",
-                "London (.L)":     ".L",
-                "Toronto (.TO)":   ".TO",
-                "Hong Kong (.HK)": ".HK",
-                "Custom…":         "__custom__",
-            }
-            suffix_choice = st.selectbox(
-                "Exchange",
-                list(suffix_options.keys()),
-                index=0,
-                key="ta_suffix_choice",
-            )
-            if suffix_choice == "Custom…":
-                ta_suffix = st.text_input(
-                    "Custom suffix (e.g. .SI, .DE)",
-                    value=".AX",
-                    key="ta_suffix_custom",
-                ).strip()
-            else:
-                ta_suffix = suffix_options[suffix_choice]
-
-        with col_btn:
-            st.write("")  # vertical alignment nudge
-            st.write("")
-            analyse_btn = st.button("🔍 Analyse", key="ta_analyse_btn", use_container_width=True)
-
-        ta_question = st.text_input(
-            "Optional: specific question for the AI signal",
-            value="",
-            placeholder="e.g. Is a breakout forming? What are the key support levels?",
-            key="ta_question",
-        ).strip() or None
-
-        # Timeframe multi-select
-        tf_labels = {"5m": "5-Minute", "30m": "30-Minute", "1h": "1-Hour", "1d": "Daily"}
-        ta_timeframes = st.multiselect(
-            "Timeframes to include",
-            options=list(tf_labels.keys()),
-            default=["5m", "30m", "1h", "1d"],
-            format_func=lambda x: tf_labels[x],
-            key="ta_timeframes",
+        # ── Mode selector ─────────────────────────────────────────────────────
+        ta_mode = st.radio(
+            "Mode",
+            ["🔍 Single Stock", "📋 Watchlist Scanner"],
+            horizontal=True,
+            key="ta_mode",
         )
-        if not ta_timeframes:
-            ta_timeframes = ["1d"]
 
-        # ── Run analysis ─────────────────────────────────────────────────────
-        if analyse_btn and ta_ticker:
-            from agents.technical_analysis import (
-                fetch_all_timeframes,
-                build_technical_context,
-                generate_technical_signal,
+        # ── Shared: exchange suffix selector ─────────────────────────────────
+        suffix_options = {
+            "ASX (.AX)":       ".AX",
+            "NYSE / NASDAQ":   "",
+            "London (.L)":     ".L",
+            "Toronto (.TO)":   ".TO",
+            "Hong Kong (.HK)": ".HK",
+            "Custom…":         "__custom__",
+        }
+        tf_labels = {"5m": "5-Minute", "30m": "30-Minute", "1h": "1-Hour", "1d": "Daily"}
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SINGLE STOCK MODE
+        # ══════════════════════════════════════════════════════════════════════
+        if ta_mode == "🔍 Single Stock":
+            st.caption(
+                "Live multi-timeframe price analysis powered by Yahoo Finance + "
+                "optional sector/macro context enrichment. Works without any announcement."
             )
 
-            yf_symbol = f"{ta_ticker}{ta_suffix}"
+            col_ticker, col_suffix, col_btn = st.columns([3, 2, 1])
 
-            with st.spinner(f"Fetching price data for {yf_symbol} across {len(ta_timeframes)} timeframe(s)…"):
-                indicators_by_tf = fetch_all_timeframes(
-                    ta_ticker,
-                    suffix=ta_suffix,
-                    timeframes=tuple(ta_timeframes),
+            with col_ticker:
+                ta_ticker = st.text_input(
+                    "Ticker symbol",
+                    value="BHP",
+                    placeholder="e.g. BHP, CBA, AAPL, BP",
+                    key="ta_ticker",
+                    help="Enter a bare ticker. The exchange suffix is set separately.",
+                ).strip().upper()
+
+            with col_suffix:
+                suffix_choice = st.selectbox(
+                    "Exchange",
+                    list(suffix_options.keys()),
+                    index=0,
+                    key="ta_suffix_choice",
+                )
+                if suffix_choice == "Custom…":
+                    ta_suffix = st.text_input(
+                        "Custom suffix (e.g. .SI, .DE)",
+                        value=".AX",
+                        key="ta_suffix_custom",
+                    ).strip()
+                else:
+                    ta_suffix = suffix_options[suffix_choice]
+
+            with col_btn:
+                st.write("")
+                st.write("")
+                analyse_btn = st.button(
+                    "🔍 Analyse", key="ta_analyse_btn", use_container_width=True
                 )
 
-            available = [tf for tf, v in indicators_by_tf.items() if v is not None]
+            ta_question = st.text_input(
+                "Optional: specific question for the AI signal",
+                value="",
+                placeholder="e.g. Is a breakout forming? What are the key support levels?",
+                key="ta_question",
+            ).strip() or None
 
-            if not available:
-                st.warning(
-                    f"⚠️ No price data found for **{yf_symbol}**. "
-                    "Check the ticker symbol and exchange suffix. "
-                    "Yahoo Finance may also be rate-limiting — wait 30 seconds and retry."
+            ta_timeframes = st.multiselect(
+                "Timeframes to include",
+                options=list(tf_labels.keys()),
+                default=["5m", "30m", "1h", "1d"],
+                format_func=lambda x: tf_labels[x],
+                key="ta_timeframes",
+            )
+            if not ta_timeframes:
+                ta_timeframes = ["1d"]
+
+            # Enhancement toggles
+            col_opt1, col_opt2 = st.columns(2)
+            with col_opt1:
+                use_macro = st.checkbox(
+                    "🌐 Include Sector & Macro Context",
+                    value=False,
+                    key="ta_use_macro",
+                    help=(
+                        "Fetches sector ETF performance, commodity prices, and FX rates "
+                        "relevant to this stock and injects them into the LLM prompt. "
+                        "Adds ~5 seconds for data fetch."
+                    ),
                 )
-                st.session_state["ta_indicators"] = None
-                st.session_state["ta_context"]    = None
-                st.session_state["ta_signal"]     = None
-                st.session_state["ta_symbol"]     = yf_symbol
-            else:
-                st.success(f"✅ Price data loaded for: **{', '.join(available)}**")
+            with col_opt2:
+                use_vision = st.checkbox(
+                    "📷 Chart Vision Analysis",
+                    value=False,
+                    key="ta_use_vision",
+                    help=(
+                        "Renders a 3-panel technical chart (Price+BB+EMAs / RSI / MACD) "
+                        "and sends it to Gemini Vision for visual pattern recognition. "
+                        "Identifies chart patterns (H&S, wedges, triangles) and divergences."
+                    ),
+                )
 
-                # Build and cache context + signal
-                ctx = build_technical_context(ta_ticker, indicators_by_tf, suffix=ta_suffix)
-                st.session_state["ta_indicators"] = indicators_by_tf
-                st.session_state["ta_context"]    = ctx
-                st.session_state["ta_symbol"]     = yf_symbol
-                st.session_state["ta_suffix"]     = ta_suffix
+            # ── Run analysis ─────────────────────────────────────────────────
+            if analyse_btn and ta_ticker:
+                from agents.technical_analysis import (
+                    fetch_all_timeframes,
+                    fetch_ohlcv,
+                    build_technical_context,
+                    generate_technical_signal,
+                )
 
-                with st.spinner("Generating AI technical signal… (~20–40 s)"):
-                    signal_md = generate_technical_signal(
+                yf_symbol = f"{ta_ticker}{ta_suffix}"
+
+                with st.spinner(
+                    f"Fetching price data for {yf_symbol} across "
+                    f"{len(ta_timeframes)} timeframe(s)…"
+                ):
+                    indicators_by_tf = fetch_all_timeframes(
                         ta_ticker,
                         suffix=ta_suffix,
-                        question=ta_question,
                         timeframes=tuple(ta_timeframes),
-                        indicators_by_tf=indicators_by_tf,
                     )
-                st.session_state["ta_signal"] = signal_md
 
-        # ── Display results ───────────────────────────────────────────────────
-        if st.session_state.get("ta_context"):
-            st.divider()
-            sym = st.session_state.get("ta_symbol", "")
-            st.subheader(f"📈 Indicator Summary — {sym}")
-            with st.expander("Raw indicator data (all timeframes)", expanded=False):
-                st.code(st.session_state["ta_context"], language=None)
+                available = [tf for tf, v in indicators_by_tf.items() if v is not None]
 
-            # Quick snapshot table for available timeframes
-            inds = st.session_state.get("ta_indicators", {})
-            snap_rows = []
-            for tf in ["5m", "30m", "1h", "1d"]:
-                ind = inds.get(tf)
-                if ind is None:
-                    continue
-                snap_rows.append({
-                    "Timeframe": tf_labels.get(tf, tf),
-                    "Price":     f"${ind['current_price']:.4f}",
-                    "Change":    (
-                        f"+{ind['change_pct']}%" if ind.get("change_pct", 0) and ind["change_pct"] >= 0
-                        else (f"{ind['change_pct']}%" if ind.get("change_pct") is not None else "N/A")
-                    ),
-                    "Trend":     ind.get("trend", "N/A"),
-                    "RSI(14)":   str(ind["rsi"]) + f" ({ind['rsi_label']})" if ind.get("rsi") else "N/A",
-                    "MACD":      ind.get("macd_label", "N/A"),
-                    "BB%":       f"{ind['bb_pct']:.2f} — {ind['bb_label']}" if ind.get("bb_pct") is not None else "N/A",
-                    "Vol Ratio": f"{ind['vol_ratio']}×" if ind.get("vol_ratio") else "N/A",
-                })
+                if not available:
+                    st.warning(
+                        f"⚠️ No price data found for **{yf_symbol}**. "
+                        "Check the ticker symbol and exchange suffix. "
+                        "Yahoo Finance may be rate-limiting — wait 30 s and retry."
+                    )
+                    for k in ("ta_indicators", "ta_context", "ta_signal",
+                              "ta_chart_bytes", "ta_vision", "ta_macro_ctx"):
+                        st.session_state[k] = None
+                    st.session_state["ta_symbol"] = yf_symbol
+                else:
+                    st.success(f"✅ Price data loaded for: **{', '.join(available)}**")
 
-            if snap_rows:
-                import pandas as pd
-                st.dataframe(pd.DataFrame(snap_rows).set_index("Timeframe"), use_container_width=True)
+                    ctx = build_technical_context(
+                        ta_ticker, indicators_by_tf, suffix=ta_suffix
+                    )
+                    st.session_state["ta_indicators"] = indicators_by_tf
+                    st.session_state["ta_context"]    = ctx
+                    st.session_state["ta_symbol"]     = yf_symbol
+                    st.session_state["ta_suffix"]     = ta_suffix
 
-        if st.session_state.get("ta_signal"):
-            st.divider()
-            sym = st.session_state.get("ta_symbol", "")
-            st.subheader(f"🎯 AI Technical Signal — {sym}")
-            st.markdown(st.session_state["ta_signal"])
+                    # Optional: macro/sector context
+                    macro_ctx = ""
+                    if use_macro:
+                        with st.spinner("Fetching sector/macro context…"):
+                            try:
+                                from agents.market_context import fetch_sector_context
+                                macro_ctx = fetch_sector_context(ta_ticker, ta_suffix)
+                                st.session_state["ta_macro_ctx"] = macro_ctx
+                                with st.expander("🌐 Sector & Macro Context", expanded=False):
+                                    st.code(macro_ctx, language=None)
+                            except Exception as exc:
+                                st.warning(f"Macro context unavailable: {exc}")
+                                st.session_state["ta_macro_ctx"] = ""
+                    else:
+                        st.session_state["ta_macro_ctx"] = ""
+
+                    # Optional: chart rendering for Vision
+                    chart_bytes = None
+                    if use_vision:
+                        with st.spinner("Rendering chart for Vision analysis…"):
+                            try:
+                                from agents.technical_analysis import fetch_ohlcv
+                                from agents.chart_vision import render_chart
+                                chart_df = fetch_ohlcv(ta_ticker, "1d", ta_suffix)
+                                if chart_df is not None:
+                                    ind_1d = indicators_by_tf.get("1d")
+                                    chart_bytes = render_chart(
+                                        ta_ticker, chart_df, ind_1d,
+                                        suffix=ta_suffix, timeframe="1d",
+                                    )
+                                    st.session_state["ta_chart_bytes"] = chart_bytes
+                                else:
+                                    st.warning("Could not fetch 1d data for chart rendering.")
+                                    st.session_state["ta_chart_bytes"] = None
+                            except Exception as exc:
+                                st.warning(f"Chart render failed: {exc}")
+                                st.session_state["ta_chart_bytes"] = None
+
+                    with st.spinner("Generating AI technical signal… (~20–40 s)"):
+                        signal_md = generate_technical_signal(
+                            ta_ticker,
+                            suffix=ta_suffix,
+                            question=ta_question,
+                            timeframes=tuple(ta_timeframes),
+                            indicators_by_tf=indicators_by_tf,
+                            macro_context=macro_ctx,
+                        )
+                    st.session_state["ta_signal"]  = signal_md
+                    st.session_state["ta_vision"]  = None  # reset vision until button pressed
+
+            # ── Display: indicator snapshot ───────────────────────────────────
+            if st.session_state.get("ta_context"):
+                st.divider()
+                sym = st.session_state.get("ta_symbol", "")
+                st.subheader(f"📈 Indicator Summary — {sym}")
+                with st.expander("Raw indicator data (all timeframes)", expanded=False):
+                    st.code(st.session_state["ta_context"], language=None)
+
+                inds = st.session_state.get("ta_indicators", {})
+                snap_rows = []
+                for tf in ["5m", "30m", "1h", "1d"]:
+                    ind = inds.get(tf)
+                    if ind is None:
+                        continue
+                    snap_rows.append({
+                        "Timeframe": tf_labels.get(tf, tf),
+                        "Price":     f"${ind['current_price']:.4f}",
+                        "Change":    (
+                            f"+{ind['change_pct']}%"
+                            if ind.get("change_pct") is not None and ind["change_pct"] >= 0
+                            else (f"{ind['change_pct']}%" if ind.get("change_pct") is not None else "N/A")
+                        ),
+                        "Trend":     ind.get("trend", "N/A"),
+                        "RSI(14)":   (
+                            f"{ind['rsi']} ({ind['rsi_label']})"
+                            if ind.get("rsi") else "N/A"
+                        ),
+                        "MACD":      ind.get("macd_label", "N/A"),
+                        "BB%":       (
+                            f"{ind['bb_pct']:.2f} — {ind['bb_label']}"
+                            if ind.get("bb_pct") is not None else "N/A"
+                        ),
+                        "Vol Ratio": f"{ind['vol_ratio']}×" if ind.get("vol_ratio") else "N/A",
+                    })
+
+                if snap_rows:
+                    import pandas as pd
+                    st.dataframe(
+                        pd.DataFrame(snap_rows).set_index("Timeframe"),
+                        use_container_width=True,
+                    )
+
+            # ── Display: AI signal ────────────────────────────────────────────
+            if st.session_state.get("ta_signal"):
+                st.divider()
+                sym = st.session_state.get("ta_symbol", "")
+                st.subheader(f"🎯 AI Technical Signal — {sym}")
+                st.markdown(st.session_state["ta_signal"])
+                macro_note = (
+                    "  |  🌐 Sector/macro context injected"
+                    if st.session_state.get("ta_macro_ctx") else ""
+                )
+                st.caption(
+                    "LLM chain: Gemini (draft + grounding) → GPT reviewer"
+                    f"{macro_note}  |  Data: Yahoo Finance"
+                )
+
+            # ── Display: Chart Vision analysis ────────────────────────────────
+            chart_bytes_cached = st.session_state.get("ta_chart_bytes")
+            if chart_bytes_cached:
+                st.divider()
+                st.subheader("📷 Chart Vision Analysis")
+                col_chart, col_vis = st.columns([2, 1])
+                with col_chart:
+                    st.image(chart_bytes_cached, caption="Technical Chart (1D)", use_container_width=True)
+                with col_vis:
+                    if st.button(
+                        "🔭 Analyse Chart with Gemini Vision",
+                        key="ta_vision_btn",
+                        use_container_width=True,
+                        help="Sends the chart to Gemini Vision for visual pattern recognition",
+                    ):
+                        with st.spinner("Gemini Vision analysing chart patterns…"):
+                            try:
+                                from agents.chart_vision import analyse_chart_with_gemini
+                                sym_state = st.session_state.get("ta_symbol", "")
+                                suf_state = st.session_state.get("ta_suffix", ".AX")
+                                ind_1d    = (
+                                    st.session_state.get("ta_indicators", {}).get("1d")
+                                )
+                                vision_md = analyse_chart_with_gemini(
+                                    sym_state.replace(suf_state, ""),
+                                    chart_bytes_cached,
+                                    indicators=ind_1d,
+                                    suffix=suf_state,
+                                    timeframe="1d",
+                                )
+                                st.session_state["ta_vision"] = vision_md
+                            except Exception as exc:
+                                st.error(f"Vision analysis failed: {exc}")
+
+                if st.session_state.get("ta_vision"):
+                    st.markdown(st.session_state["ta_vision"])
+
+        # ══════════════════════════════════════════════════════════════════════
+        # WATCHLIST SCANNER MODE
+        # ══════════════════════════════════════════════════════════════════════
+        else:
             st.caption(
-                "LLM chain: Gemini flash-lite (draft) → GPT reviewer (compliance + quality gate)  |  "
-                "Data source: Yahoo Finance via yfinance"
+                "Scan multiple tickers in parallel. "
+                "Fetches live price data for each ticker and builds a summary table. "
+                "Select any ticker from the results to generate a full AI signal."
             )
+
+            wl_col1, wl_col2 = st.columns([3, 1])
+
+            with wl_col1:
+                wl_raw = st.text_area(
+                    "Tickers (one per line or comma-separated)",
+                    value="BHP\nCBA\nCSL\nWBC\nRIO",
+                    height=120,
+                    key="wl_tickers_input",
+                    placeholder="BHP\nRIO\nCBA\nAAPL\nNVDA",
+                )
+
+            with wl_col2:
+                suffix_choice_wl = st.selectbox(
+                    "Exchange",
+                    list(suffix_options.keys()),
+                    index=0,
+                    key="wl_suffix_choice",
+                )
+                if suffix_choice_wl == "Custom…":
+                    wl_suffix = st.text_input(
+                        "Custom suffix", value=".AX", key="wl_suffix_custom"
+                    ).strip()
+                else:
+                    wl_suffix = suffix_options[suffix_choice_wl]
+
+                scan_btn = st.button(
+                    "🚀 Scan Watchlist",
+                    key="wl_scan_btn",
+                    use_container_width=True,
+                    type="primary",
+                )
+
+            # Parse tickers
+            wl_tickers = []
+            for raw in wl_raw.replace(",", "\n").splitlines():
+                t = raw.strip().upper()
+                if t:
+                    wl_tickers.append(t)
+            wl_tickers = list(dict.fromkeys(wl_tickers))  # deduplicate, preserve order
+
+            if scan_btn and wl_tickers:
+                from agents.technical_analysis import fetch_all_timeframes
+                import concurrent.futures
+
+                def _scan_one(ticker: str):
+                    """Fetch 1d indicators for a single ticker — designed for ThreadPool."""
+                    try:
+                        inds = fetch_all_timeframes(
+                            ticker,
+                            suffix=wl_suffix,
+                            timeframes=("1d",),
+                        )
+                        return ticker, inds.get("1d")
+                    except Exception as exc:
+                        return ticker, None
+
+                progress = st.progress(0, text=f"Scanning {len(wl_tickers)} tickers…")
+                results = {}
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                    futures = {pool.submit(_scan_one, t): t for t in wl_tickers}
+                    done = 0
+                    for fut in concurrent.futures.as_completed(futures):
+                        ticker, ind = fut.result()
+                        results[ticker] = ind
+                        done += 1
+                        progress.progress(
+                            done / len(wl_tickers),
+                            text=f"Scanned {done}/{len(wl_tickers)}: {ticker}",
+                        )
+
+                progress.empty()
+                st.session_state["wl_results"] = results
+                st.session_state["wl_suffix"]  = wl_suffix
+
+            # ── Watchlist summary table ───────────────────────────────────────
+            wl_results = st.session_state.get("wl_results", {})
+            if wl_results:
+                import pandas as pd
+
+                rows = []
+                for ticker, ind in wl_results.items():
+                    if ind is None:
+                        rows.append({
+                            "Ticker":    ticker,
+                            "Price":     "N/A",
+                            "1d %":      "N/A",
+                            "Trend":     "—",
+                            "RSI(14)":   "N/A",
+                            "MACD":      "—",
+                            "BB%":       "N/A",
+                            "Vol Ratio": "N/A",
+                            "⚡ Signal":  "NO DATA",
+                        })
+                        continue
+
+                    p   = ind.get("current_price", 0)
+                    chg = ind.get("change_pct")
+                    chg_str = (
+                        f"+{chg}%" if chg is not None and chg >= 0
+                        else (f"{chg}%" if chg is not None else "N/A")
+                    )
+
+                    rsi = ind.get("rsi")
+                    rsi_lbl = ind.get("rsi_label", "")
+                    macd = ind.get("macd_label", "—")
+                    bp   = ind.get("bb_pct")
+
+                    # Compute a quick composite signal (no LLM — deterministic)
+                    bullish = 0
+                    bearish = 0
+                    if rsi and rsi < 40: bullish += 1
+                    if rsi and rsi > 65: bearish += 1
+                    if macd == "BULLISH": bullish += 1
+                    if macd == "BEARISH": bearish += 1
+                    trend = ind.get("trend", "")
+                    if trend == "UPTREND":   bullish += 1
+                    if trend == "DOWNTREND": bearish += 1
+                    if bp is not None and bp < 0.20: bullish += 1
+                    if bp is not None and bp > 0.80: bearish += 1
+
+                    if   bullish >= 3: quick_sig = "🟢 STRONG BUY"
+                    elif bullish == 2: quick_sig = "🟩 BUY"
+                    elif bearish >= 3: quick_sig = "🔴 STRONG SELL"
+                    elif bearish == 2: quick_sig = "🟥 SELL"
+                    else:              quick_sig = "⬜ HOLD/NEUTRAL"
+
+                    rows.append({
+                        "Ticker":    ticker,
+                        "Price":     f"${p:.4f}",
+                        "1d %":      chg_str,
+                        "Trend":     trend or "—",
+                        "RSI(14)":   f"{rsi} ({rsi_lbl})" if rsi else "N/A",
+                        "MACD":      macd or "—",
+                        "BB%":       f"{bp:.2f} — {ind.get('bb_label','')}" if bp is not None else "N/A",
+                        "Vol Ratio": f"{ind['vol_ratio']}×" if ind.get("vol_ratio") else "N/A",
+                        "⚡ Signal":  quick_sig,
+                    })
+
+                st.divider()
+                wl_suf = st.session_state.get("wl_suffix", "")
+                st.subheader(f"📋 Watchlist Scan Results — {len(rows)} tickers ({wl_suf or 'US'})")
+                df_wl = pd.DataFrame(rows).set_index("Ticker")
+                st.dataframe(df_wl, use_container_width=True)
+
+                # ── Full AI signal for a selected ticker ──────────────────────
+                st.divider()
+                st.subheader("🎯 Generate Full AI Signal")
+                available_tickers = [
+                    t for t, ind in wl_results.items() if ind is not None
+                ]
+                if available_tickers:
+                    sel_col, btn_col = st.columns([3, 1])
+                    with sel_col:
+                        wl_sel_ticker = st.selectbox(
+                            "Select ticker for full signal",
+                            available_tickers,
+                            key="wl_sel_ticker",
+                        )
+                    with btn_col:
+                        st.write("")
+                        wl_signal_btn = st.button(
+                            "Generate Signal",
+                            key="wl_signal_btn",
+                            use_container_width=True,
+                            type="primary",
+                        )
+
+                    if wl_signal_btn and wl_sel_ticker:
+                        from agents.technical_analysis import (
+                            fetch_all_timeframes,
+                            build_technical_context,
+                            generate_technical_signal,
+                        )
+                        wl_suf_now = st.session_state.get("wl_suffix", ".AX")
+
+                        with st.spinner(
+                            f"Fetching all timeframes + generating signal for "
+                            f"{wl_sel_ticker}{wl_suf_now}…"
+                        ):
+                            full_inds = fetch_all_timeframes(
+                                wl_sel_ticker,
+                                suffix=wl_suf_now,
+                                timeframes=("5m", "30m", "1h", "1d"),
+                            )
+                            wl_signal_md = generate_technical_signal(
+                                wl_sel_ticker,
+                                suffix=wl_suf_now,
+                                indicators_by_tf=full_inds,
+                            )
+
+                        st.session_state["wl_full_signal"]        = wl_signal_md
+                        st.session_state["wl_full_signal_ticker"] = (
+                            f"{wl_sel_ticker}{wl_suf_now}"
+                        )
+
+                    if st.session_state.get("wl_full_signal"):
+                        st.error(
+                            "⚠️ **NOT FINANCIAL ADVICE** — AI-generated signal for "
+                            "informational and educational purposes only.",
+                            icon="⚠️",
+                        )
+                        st.subheader(
+                            f"🎯 {st.session_state.get('wl_full_signal_ticker', '')} — Full Signal"
+                        )
+                        st.markdown(st.session_state["wl_full_signal"])
+                else:
+                    st.info("No tickers with valid price data available for signal generation.")
