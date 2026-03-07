@@ -37,6 +37,19 @@ models:
         - "traceability"
         - "governance"
         - "published"
+    marts:
+      +schema: trace_marts
+      +materialized: table
+      dimensions:
+        +tags:
+          - "traceability"
+          - "marts"
+          - "dimension"
+      facts:
+        +tags:
+          - "traceability"
+          - "marts"
+          - "fact"
 
 tests:
   +store_failures: true

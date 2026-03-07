@@ -1,0 +1,400 @@
+version: 2
+
+# ── DIMENSION TABLES ──────────────────────────────────────────────────────────
+
+models:
+  - name: dim_users
+    description: >
+      One row per (tenant_id, user_id). Lifetime activity and risk profile for
+      each user. Use as a Lightdash dimension table to drill into per-user behaviour.
+    meta:
+      label: "Users"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: user_id
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: user_risk_tier
+        description: "CRITICAL | HIGH | MEDIUM | LOW — worst-case risk tier for this user."
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: highest_sensitivity_seen
+        description: "Highest sensitivity level (LOW|MEDIUM|HIGH|CRITICAL) this user has ever accessed."
+        meta:
+          dimension:
+            type: string
+      - name: total_requests
+        meta:
+          metrics:
+            total_user_requests:
+              type: sum
+              label: "Total Requests"
+      - name: boundary_violations
+        meta:
+          metrics:
+            total_boundary_violations:
+              type: sum
+              label: "Boundary Violations"
+      - name: first_seen_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: last_seen_at
+        meta:
+          dimension:
+            type: timestamp
+
+  - name: dim_workspaces
+    description: >
+      One row per (tenant_id, workspace_id). Workspace-level activity and risk
+      profile. Use for cross-workspace governance comparison in Lightdash.
+    meta:
+      label: "Workspaces"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: workspace_id
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: workspace_risk_tier
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: distinct_users
+        meta:
+          metrics:
+            total_distinct_users:
+              type: sum
+              label: "Total Users"
+      - name: boundary_violations
+        meta:
+          metrics:
+            workspace_boundary_violations:
+              type: sum
+              label: "Boundary Violations"
+
+  - name: dim_datasources
+    description: >
+      One row per (tenant_id, datasource_name). Usage and risk profile per
+      connected datasource. Use to see which datasources carry the most risk.
+    meta:
+      label: "Datasources"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: datasource_name
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: datasource_risk_tier
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: sql_executed
+        meta:
+          metrics:
+            total_sql_executions:
+              type: sum
+              label: "Total SQL Executions"
+      - name: pii_events
+        meta:
+          metrics:
+            total_pii_events:
+              type: sum
+              label: "PII Events"
+
+  - name: dim_models
+    description: >
+      One row per (tenant_id, model_name). LLM model usage, quality, and risk
+      profile. Use for model-level compliance and cost tracking.
+    meta:
+      label: "AI Models"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: model_name
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: total_invocations
+        meta:
+          metrics:
+            total_model_invocations:
+              type: sum
+              label: "Total Invocations"
+      - name: error_rate_pct
+        description: "Percentage of invocations that errored."
+        meta:
+          metrics:
+            avg_model_error_rate:
+              type: average
+              label: "Avg Error Rate %"
+      - name: human_corrections
+        meta:
+          metrics:
+            total_human_corrections:
+              type: sum
+              label: "Human Corrections"
+
+
+# ── FACT TABLES ───────────────────────────────────────────────────────────────
+
+  - name: fct_ai_requests
+    description: >
+      One row per (tenant_id, request_id). The primary fact table for all AI
+      requests. Includes verbatim compliance fields (question_text, sql_generated_text,
+      sql_executed_text) and agentic audit fields (boundary_violated, agent_actions_taken).
+
+      Join to:
+        dim_users       on tenant_id + user_id
+        dim_workspaces  on tenant_id + workspace_id
+        dim_models      on tenant_id + primary_model
+    meta:
+      label: "AI Requests"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: request_id
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: risk_level
+        description: "NONE | LOW | MEDIUM | HIGH | CRITICAL"
+        tests:
+          - accepted_values:
+              values: [NONE, LOW, MEDIUM, HIGH, CRITICAL]
+        meta:
+          dimension:
+            type: string
+      - name: question_text
+        description: "Verbatim user question (credentials masked). Compliance audit field."
+      - name: sql_generated_text
+        description: "Verbatim SQL generated. Compliance audit field."
+      - name: boundary_violated
+        description: "1 if any agent action violated a boundary during this request."
+        meta:
+          metrics:
+            requests_with_boundary_violation:
+              type: count_distinct
+              sql: "case when ${boundary_violated} = 1 then ${request_id} end"
+              label: "Requests with Boundary Violations"
+      - name: request_started_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: total_request_ms
+        description: "End-to-end request latency in milliseconds."
+        meta:
+          metrics:
+            avg_request_latency_ms:
+              type: average
+              label: "Avg Request Latency (ms)"
+      - name: sql_blocked_count
+        meta:
+          metrics:
+            total_sql_blocked:
+              type: sum
+              label: "Total SQL Blocked"
+      - name: policy_blocks
+        meta:
+          metrics:
+            total_policy_blocks:
+              type: sum
+              label: "Total Policy Blocks"
+
+  - name: fct_sql_generations
+    description: >
+      One row per SQL generation event. Event-grain fact table for SQL audit
+      and risk analysis. Verbatim sql_text stored for regulatory compliance.
+
+      Join to:
+        dim_users        on tenant_id + user_id
+        dim_datasources  on tenant_id + datasource_name
+        dim_models       on tenant_id + model_name
+    meta:
+      label: "SQL Generations"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        tests:
+          - not_null
+          - unique
+      - name: sql_text
+        description: "Verbatim SQL generated. Compliance audit field. NOT the result rows."
+      - name: sql_hash
+        description: "SHA-256 fingerprint for deduplication."
+      - name: sql_risk_level
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: generated_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: generated_date
+        meta:
+          dimension:
+            type: date
+      - name: pii_detected
+        meta:
+          metrics:
+            pii_sql_generations:
+              type: count_distinct
+              sql: "case when ${pii_detected} = true then ${trace_id} end"
+              label: "SQL Generations with PII"
+
+  - name: fct_sql_executions
+    description: >
+      One row per SQL execution event. Definitive data access audit log.
+      sql_text is the exact query that ran — never the result data.
+
+      Join to:
+        dim_users        on tenant_id + user_id
+        dim_datasources  on tenant_id + datasource_name
+    meta:
+      label: "SQL Executions"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        tests:
+          - not_null
+          - unique
+      - name: sql_text
+        description: "Verbatim SQL that executed. Compliance audit field."
+      - name: executed_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: executed_date
+        meta:
+          dimension:
+            type: date
+
+  - name: fct_policy_checks
+    description: >
+      One row per governance policy check, including passed, blocked, and
+      boundary violation events. Core table for compliance enforcement audit.
+    meta:
+      label: "Policy Checks"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        tests:
+          - not_null
+          - unique
+      - name: check_outcome
+        description: "PASSED | SQL_BLOCKED | POLICY_FAILED | AGENT_BOUNDARY_VIOLATION | OTHER"
+        tests:
+          - accepted_values:
+              values: [PASSED, SQL_BLOCKED, POLICY_FAILED, AGENT_BOUNDARY_VIOLATION, OTHER]
+        meta:
+          dimension:
+            type: string
+      - name: checked_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: is_boundary_violation
+        meta:
+          metrics:
+            total_boundary_violations:
+              type: count_distinct
+              sql: "case when ${is_boundary_violation} = true then ${trace_id} end"
+              label: "Boundary Violations"
+
+  - name: fct_ai_tool_calls
+    description: >
+      One row per tool invocation or autonomous agent action.
+      Primary audit table for AI agentic behaviour. Every tool call and
+      agent action is recorded here for security review.
+    meta:
+      label: "AI Tool Calls"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        tests:
+          - not_null
+          - unique
+      - name: tool_call_risk_level
+        description: "CRITICAL | HIGH | MEDIUM | LOW"
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: event_type
+        description: "tool_invoked | agent_action | agent_boundary_violation"
+        meta:
+          dimension:
+            type: string
+      - name: boundary_violated
+        meta:
+          metrics:
+            agentic_boundary_violations:
+              type: count_distinct
+              sql: "case when ${boundary_violated} = true then ${trace_id} end"
+              label: "Agent Boundary Violations"
+      - name: invoked_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: invoked_date
+        meta:
+          dimension:
+            type: date
+
+  - name: fct_rag_retrievals
+    description: >
+      One row per RAG chunk lookup or memory retrieval.
+      Tracks what context was retrieved for each request, which datasource
+      it came from, and any sensitivity classification.
+    meta:
+      label: "RAG Retrievals"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        tests:
+          - not_null
+          - unique
+      - name: event_type
+        description: "rag_retrieved | memory_retrieved"
+        meta:
+          dimension:
+            type: string
+      - name: retrieved_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: retrieved_date
+        meta:
+          dimension:
+            type: date
+      - name: pii_detected
+        meta:
+          metrics:
+            rag_retrievals_with_pii:
+              type: count_distinct
+              sql: "case when ${pii_detected} = true then ${trace_id} end"
+              label: "RAG Retrievals with PII"
