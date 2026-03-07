@@ -59,10 +59,24 @@ session_agg as (
         count_if(is_error)                                as error_events,
         count_if(is_human_correction)                     as human_corrections,
 
-        -- Risk indicator
+        -- AI agentic activity
+        count_if(is_agent_event)                          as agent_events,
+        count_if(is_boundary_violation)                   as boundary_violations,
+        listagg(
+            case when is_boundary_violation then risk_flags end, ', '
+        ) within group (order by event_timestamp)         as boundary_violation_risks,
+
+        -- Sensitivity / PII
+        count_if(is_high_sensitivity)                     as high_sensitivity_events,
+        count_if(pii_detected = true)                     as pii_events,
+
+        -- Risk indicator (accounts for agentic boundary violations)
         case
+            when count_if(is_boundary_violation)      > 0  then 'CRITICAL'
             when count_if(event_type = 'sql_blocked') > 0  then 'HIGH'
             when count_if(is_policy_blocked)          > 0  then 'MEDIUM'
+            when count_if(is_high_sensitivity)        > 0  then 'MEDIUM'
+            when count_if(pii_detected = true)        > 0  then 'MEDIUM'
             when count_if(is_error)                   > 0  then 'LOW'
             else 'NONE'
         end                                               as session_risk_level

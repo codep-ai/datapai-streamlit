@@ -39,18 +39,34 @@ violations as (
         datasource_name,
         model_name,
         tool_name,
+        agent_name,
         policy_result,
-        input_summary,
-        output_summary,
+
+        -- ── COMPLIANCE: verbatim question and SQL ──────────────────────────
+        -- Regulators need the exact question and SQL for each violation.
+        question_text,
+        sql_text,
         sql_hash,
+
+        -- ── COMPLIANCE: sensitivity and PII ───────────────────────────────
+        sensitivity_level,
+        pii_detected,
+        pii_fields,
+
+        -- ── AI AGENTIC: what the agent did ────────────────────────────────
+        ai_action_summary,
+        boundary_violated,
+        risk_flags,
+
         status,
         error_code,
         error_message,
         etl_run_id,
 
-        -- Classification
+        -- Classification (includes agentic boundary violations)
         case
-            when event_type = 'sql_blocked'        then 'SQL_BLOCKED'
+            when is_boundary_violation              then 'AGENT_BOUNDARY_VIOLATION'
+            when event_type = 'sql_blocked'         then 'SQL_BLOCKED'
             when event_type = 'policy_check_failed' then 'POLICY_FAILED'
             when status = 'blocked'                 then 'ACTION_BLOCKED'
             when status = 'failed'                  then 'ACTION_FAILED'
@@ -61,9 +77,10 @@ violations as (
 
     from events
     where
-        is_policy_blocked = true
-        or is_error = true
-        or event_type in ('sql_blocked', 'policy_check_failed')
+        is_policy_blocked    = true
+        or is_boundary_violation = true
+        or is_error          = true
+        or event_type in ('sql_blocked', 'policy_check_failed', 'agent_boundary_violation')
 
 )
 

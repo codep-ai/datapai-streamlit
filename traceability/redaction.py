@@ -136,3 +136,34 @@ def safe_repr(obj: Any, max_len: int = 200) -> str:
     """
     raw = repr(obj) if not isinstance(obj, str) else obj
     return summarise(raw, max_len=max_len) or ""
+
+
+# ── Compliance-aware masking ───────────────────────────────────────────────────
+
+# Patterns that represent credentials accidentally typed — mask these even in
+# question_text.  Do NOT mask business content (company names, product names,
+# financial terms, question phrasing, etc.).
+_CREDENTIAL_ONLY_PATTERNS: list[re.Pattern] = [
+    re.compile(r'(?i)(api[_\-]?key|apikey|secret|token|password|passwd|pwd|bearer)["\s:=]+[A-Za-z0-9+/=_\-]{8,}'),
+    re.compile(r'(?i)(AKIA[0-9A-Z]{16})'),
+    re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+'),
+    re.compile(r'(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*'),
+    re.compile(r'-----BEGIN [A-Z ]+-----[\s\S]*?-----END [A-Z ]+-----'),
+    re.compile(r'(?i)(snowflake|postgresql|mysql|redshift)://[^\s"\']+'),
+]
+
+
+def mask_credentials_only(text: str) -> str:
+    """
+    Mask only hardcoded credentials/tokens in *text*.
+    Preserves ALL substantive content — question phrasing, table names,
+    column names, business terms, financial data references.
+
+    Use this for question_text and sql_text before storing to the audit ledger:
+    the compliance requirement is the verbatim question/SQL, with only
+    accidentally-included passwords/tokens removed.
+    """
+    result = text
+    for pat in _CREDENTIAL_ONLY_PATTERNS:
+        result = pat.sub(_REDACTED, result)
+    return result

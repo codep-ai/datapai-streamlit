@@ -52,7 +52,7 @@ sources:
               Event type enum. Values:
               request_received, session_started, memory_retrieved, rag_retrieved,
               policy_check_started, policy_check_passed, policy_check_failed,
-              model_invoked, tool_invoked,
+              model_invoked, tool_invoked, agent_action, agent_boundary_violation,
               sql_generated, sql_validated, sql_blocked, sql_executed,
               document_extracted, response_returned,
               human_feedback_received, action_replayed
@@ -69,6 +69,8 @@ sources:
                     - policy_check_failed
                     - model_invoked
                     - tool_invoked
+                    - agent_action
+                    - agent_boundary_violation
                     - sql_generated
                     - sql_validated
                     - sql_blocked
@@ -82,11 +84,11 @@ sources:
             tests:
               - not_null
           - name: actor_type
-            description: "Who/what produced this event: user | assistant | system | tool"
+            description: "Who/what produced this event: user | assistant | system | tool | agent"
             tests:
               - not_null
               - accepted_values:
-                  values: [user, assistant, system, tool]
+                  values: [user, assistant, system, tool, agent]
           - name: actor_id
             description: "Identifier of the actor (user_id, model name, tool name, etc.)."
           - name: datasource_type
@@ -97,12 +99,47 @@ sources:
             description: "LLM model name used (e.g. claude-sonnet-4-6)."
           - name: tool_name
             description: "Tool or function name invoked."
+          - name: agent_name
+            description: "Autonomous AI agent identifier (e.g. sql_agent, etl_agent)."
           - name: policy_result
             description: "Governance policy decision: PASSED | BLOCKED | SKIPPED"
+
+          # ── COMPLIANCE FIELDS (verbatim for regulatory audit) ─────────────
+          - name: question_text
+            description: >
+              The exact question the user typed, verbatim for regulatory audit.
+              Credentials (API keys, passwords) masked at ingestion.
+              All substantive business content preserved.
+              Required for SOX, MiFID II, APRA CPS 234, FedRAMP compliance.
+          - name: sql_text
+            description: >
+              The exact SQL generated or executed. NOT the result rows — query only.
+              Auditors use this to verify what data was queried.
+          - name: sensitivity_level
+            description: "Data sensitivity classification: LOW | MEDIUM | HIGH | CRITICAL"
+          - name: pii_detected
+            description: "Boolean: was Personally Identifiable Information detected in this event."
+          - name: pii_fields
+            description: >
+              JSON list of PII column/field names detected, e.g. ["email","ssn"].
+              Names only — never the actual values.
+          - name: ai_action_summary
+            description: >
+              Description of what the AI/agent did: tools called, decisions made,
+              datasources accessed. NOT the data content it returned.
+
+          # ── AI AGENTIC SECURITY FIELDS ────────────────────────────────────
+          - name: boundary_violated
+            description: "Boolean: did this AI agent action attempt to access outside its allowed scope."
+          - name: risk_flags
+            description: >
+              JSON list of detected security/compliance risks, e.g.
+              ["DDL_ATTEMPT","PII_SCHEMA_ACCESS","EXFILTRATION_RISK"].
+
           - name: input_summary
-            description: "Summarised, redacted input. No raw PII or secrets."
+            description: "Summarised, redacted input (legacy). Use question_text for compliance."
           - name: output_summary
-            description: "Summarised, redacted output. For SQL: structural summary only."
+            description: "Summarised, redacted output (legacy)."
           - name: sql_hash
             description: "SHA-256 hash of the generated SQL. Used for deduplication and comparison."
           - name: prompt_hash
@@ -110,11 +147,11 @@ sources:
           - name: context_refs
             description: "JSON list of retrieved context item IDs (RAG chunks, memory IDs)."
           - name: status
-            description: "Outcome: ok | blocked | failed | pending"
+            description: "Outcome: ok | blocked | failed | pending | violation"
             tests:
               - not_null
               - accepted_values:
-                  values: [ok, blocked, failed, pending]
+                  values: [ok, blocked, failed, pending, violation]
           - name: error_code
             description: "Machine-readable error code on failure."
           - name: error_message

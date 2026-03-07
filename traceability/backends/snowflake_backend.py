@@ -286,31 +286,70 @@ def _snowflake_ddl(table: str) -> str:
     """
     return f"""
     CREATE TABLE IF NOT EXISTS {table} (
-        trace_id         VARCHAR        NOT NULL,
-        parent_trace_id  VARCHAR,
-        tenant_id        VARCHAR        NOT NULL,
-        workspace_id     VARCHAR        NOT NULL,
-        user_id          VARCHAR        NOT NULL,
-        session_id       VARCHAR        NOT NULL,
-        request_id       VARCHAR        NOT NULL,
-        event_type       VARCHAR        NOT NULL,
-        event_timestamp  VARCHAR        NOT NULL,
-        actor_type       VARCHAR        NOT NULL,
-        actor_id         VARCHAR        NOT NULL,
-        datasource_type  VARCHAR,
-        datasource_name  VARCHAR,
-        model_name       VARCHAR,
-        tool_name        VARCHAR,
-        policy_result    VARCHAR,
-        input_summary    VARCHAR,
-        output_summary   VARCHAR,
-        sql_hash         VARCHAR,
-        prompt_hash      VARCHAR,
-        context_refs     VARCHAR,
-        status           VARCHAR        NOT NULL DEFAULT 'ok',
-        error_code       VARCHAR,
-        error_message    VARCHAR,
-        etl_run_id       VARCHAR,
+        -- Identity
+        trace_id          VARCHAR        NOT NULL,
+        parent_trace_id   VARCHAR,
+        tenant_id         VARCHAR        NOT NULL,
+        workspace_id      VARCHAR        NOT NULL,
+        user_id           VARCHAR        NOT NULL,
+        session_id        VARCHAR        NOT NULL,
+        request_id        VARCHAR        NOT NULL,
+
+        -- Event classification
+        event_type        VARCHAR        NOT NULL,
+        event_timestamp   VARCHAR        NOT NULL,
+        actor_type        VARCHAR        NOT NULL,
+        actor_id          VARCHAR        NOT NULL,
+
+        -- Data source
+        datasource_type   VARCHAR,
+        datasource_name   VARCHAR,
+
+        -- Model / tool / agent
+        model_name        VARCHAR,
+        tool_name         VARCHAR,
+        agent_name        VARCHAR,
+
+        -- Governance
+        policy_result     VARCHAR,
+        total_request_ms  NUMBER,
+
+        -- COMPLIANCE FIELDS (verbatim for regulatory audit)
+        -- The exact user question, credentials-only masking applied.
+        question_text     VARCHAR,
+        -- The exact SQL generated or executed (NOT result rows).
+        sql_text          VARCHAR,
+        -- Sensitivity classification
+        sensitivity_level VARCHAR,
+        -- PII detection
+        pii_detected      BOOLEAN,
+        pii_fields        VARCHAR,
+        -- What the AI/agent did (action description, not data content)
+        ai_action_summary VARCHAR,
+
+        -- AI AGENTIC SECURITY FIELDS
+        boundary_violated BOOLEAN,
+        risk_flags        VARCHAR,
+
+        -- Fingerprints
+        sql_hash          VARCHAR,
+        prompt_hash       VARCHAR,
+
+        -- References
+        context_refs      VARCHAR,
+
+        -- Legacy summarised fields (kept for backward compatibility)
+        input_summary     VARCHAR,
+        output_summary    VARCHAR,
+
+        -- Outcome
+        status            VARCHAR        NOT NULL DEFAULT 'ok',
+        error_code        VARCHAR,
+        error_message     VARCHAR,
+
+        -- ETL bridge
+        etl_run_id        VARCHAR,
+
         PRIMARY KEY (trace_id)
     )
     """

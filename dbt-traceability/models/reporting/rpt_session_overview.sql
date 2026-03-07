@@ -34,6 +34,16 @@ select
     policy_blocks,
     error_events,
     human_corrections,
+
+    -- AI agentic audit columns
+    agent_events,
+    boundary_violations,
+    boundary_violation_risks,
+
+    -- Compliance risk indicators
+    high_sensitivity_events,
+    pii_events,
+
     session_risk_level
 from {{ ref('int_session_summary') }}
 order by session_started_at desc

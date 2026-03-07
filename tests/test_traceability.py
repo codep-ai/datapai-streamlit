@@ -32,6 +32,7 @@ from traceability.models import (
 )
 from traceability.redaction import (
     mask_secrets,
+    mask_credentials_only,
     summarise,
     hash_payload,
     safe_sql_summary,
@@ -98,17 +99,19 @@ class TestTraceEventModel:
         assert event.user_id      == "alice"
         assert event.session_id   == "sess-alice-001"
 
-    def test_sql_is_hashed_not_stored(self, alice_identity):
+    def test_sql_stored_verbatim_and_hashed(self, alice_identity):
+        """Compliance: SQL is stored verbatim AND hashed for deduplication."""
         sql = "SELECT * FROM orders WHERE user_id = 123"
         event = TraceEvent.new(
             identity   = alice_identity,
             event_type = EventType.SQL_GENERATED,
             sql_text   = sql,
         )
+        # sql_hash must be set
         assert event.sql_hash == _sha256(sql)
-        # The raw SQL must NOT be stored anywhere in the event
+        # sql_text must be stored verbatim for compliance audit
         d = event.to_dict()
-        assert sql not in str(d.values())
+        assert d["sql_text"] == sql
 
     def test_prompt_is_hashed_not_stored(self, alice_identity):
         prompt = "You are a SQL expert. Generate SQL for: revenue by region"
@@ -321,9 +324,9 @@ class TestTraceLedger:
 
     def test_emit_request_received(self, ledger, alice_identity):
         trace_id = ledger.emit_request_received(
-            identity   = alice_identity,
-            request_id = "req-001",
-            input_text = "How many orders last week?",
+            identity      = alice_identity,
+            request_id    = "req-001",
+            question_text = "How many orders last week?",
         )
         event = ledger.get_event(trace_id)
         assert event is not None
@@ -513,18 +516,176 @@ class TestAppendOnlyInvariant:
         event = TraceEvent.new(
             identity      = alice_identity,
             event_type    = EventType.REQUEST_RECEIVED,
-            input_summary = "original summary",
+            question_text = "How many orders last week?",
         )
         sqlite_backend.append(event.to_dict())
 
         # Attempt to overwrite with a different summary
         tampered = event.to_dict()
-        tampered["input_summary"] = "TAMPERED"
+        tampered["question_text"] = "TAMPERED"
         sqlite_backend.append(tampered)
 
         rows = sqlite_backend.fetch_by_trace_id(event.trace_id)
         assert len(rows) == 1
-        assert rows[0]["input_summary"] == "original summary"
+        assert rows[0]["question_text"] == "How many orders last week?"
+
+
+
+
+# ── Verbatim compliance field tests ──────────────────────────────────────────
+
+class TestVerbatimCompliance:
+
+    def test_question_text_stored_verbatim(self, ledger, alice_identity):
+        """Compliance: verbatim question must be preserved in the ledger."""
+        question = "What is the total revenue from high-value customers in Q4?"
+        trace_id = ledger.emit_request_received(
+            identity      = alice_identity,
+            request_id    = "req-compliance-001",
+            question_text = question,
+        )
+        event = ledger.get_event(trace_id)
+        assert event["question_text"] == question
+
+    def test_sql_text_stored_verbatim(self, ledger, alice_identity):
+        """Compliance: exact SQL must be stored (not just hash) for audit."""
+        sql = "SELECT customer_id, sum(revenue) FROM orders WHERE segment='PREMIUM' GROUP BY 1"
+        trace_id = ledger.emit_sql_generated(
+            identity        = alice_identity,
+            request_id      = "req-compliance-002",
+            sql_text        = sql,
+            model_name      = "claude-sonnet-4-6",
+            datasource_name = "snowflake_prod",
+        )
+        event = ledger.get_event(trace_id)
+        # sql_text should be stored verbatim
+        assert event["sql_text"] == sql
+        # sql_hash should also be set for deduplication
+        assert event["sql_hash"] == _sha256(sql)
+
+    def test_credential_masked_in_question(self, ledger, alice_identity):
+        """Credentials must be masked but business content preserved."""
+        question = "Show revenue data, api_key=sk-secret123456789 connection=snowflake://user:pass@host/db"
+        trace_id = ledger.emit_request_received(
+            identity      = alice_identity,
+            request_id    = "req-compliance-003",
+            question_text = question,
+        )
+        event = ledger.get_event(trace_id)
+        stored = event["question_text"]
+        # Credential must be masked
+        assert "sk-secret" not in stored
+        assert "pass@host" not in stored
+        # Business content must be preserved
+        assert "revenue data" in stored
+        assert "[REDACTED]" in stored
+
+    def test_mask_credentials_only_preserves_business_content(self):
+        """mask_credentials_only: preserves question phrasing, masks only tokens."""
+        text = "Show revenue for Q4. token=eyJhbGciOiJIUzI1NiJ9.test.sig"
+        result = mask_credentials_only(text)
+        assert "revenue for Q4" in result       # business content preserved
+        assert "eyJ" not in result              # JWT masked
+        assert "[REDACTED]" in result
+
+    def test_mask_credentials_only_preserves_sql_structure(self):
+        """SQL structure must be preserved; only embedded credentials masked."""
+        sql = "SELECT * FROM orders WHERE region='APAC' -- password=hunter2abc"
+        result = mask_credentials_only(sql)
+        assert "orders" in result
+        assert "region='APAC'" in result
+        assert "hunter2" not in result
+
+    def test_sensitivity_level_stored(self, ledger, alice_identity):
+        """Sensitivity level must be stored for compliance filtering."""
+        trace_id = ledger.emit_sql_generated(
+            identity          = alice_identity,
+            request_id        = "req-compliance-004",
+            sql_text          = "SELECT ssn, name FROM employees",
+            model_name        = "claude-sonnet-4-6",
+            datasource_name   = "hr_db",
+            sensitivity_level = "HIGH",
+            pii_detected      = True,
+            pii_fields        = ["ssn", "name"],
+        )
+        event = ledger.get_event(trace_id)
+        assert event["sensitivity_level"] == "HIGH"
+        assert event["pii_detected"] in (True, 1)   # SQLite stores booleans as 0/1
+        assert "ssn" in event["pii_fields"]
+        assert "name" in event["pii_fields"]
+
+
+# ── AI Agentic traceability tests ─────────────────────────────────────────────
+
+class TestAgenticTraceability:
+
+    def test_emit_agent_action(self, ledger, alice_identity):
+        """Every autonomous agent action must be traced."""
+        trace_id = ledger.emit_agent_action(
+            identity          = alice_identity,
+            request_id        = "req-agent-001",
+            agent_name        = "sql_agent",
+            ai_action_summary = "Generated SELECT query on orders table; applied row-level security filter",
+            datasource_name   = "snowflake_prod",
+        )
+        event = ledger.get_event(trace_id)
+        assert event["event_type"]        == "agent_action"
+        assert event["agent_name"]        == "sql_agent"
+        assert event["ai_action_summary"] is not None
+        assert event["status"]            == "ok"
+
+    def test_emit_agent_boundary_violation(self, ledger, alice_identity):
+        """Boundary violations must be recorded with CRITICAL status."""
+        trace_id = ledger.emit_agent_boundary_violation(
+            identity           = alice_identity,
+            request_id         = "req-agent-002",
+            agent_name         = "etl_agent",
+            violation_summary  = "Agent attempted DDL: DROP TABLE customers",
+            risk_flags         = '["DDL_ATTEMPT","DATA_DESTRUCTION_RISK"]',
+        )
+        event = ledger.get_event(trace_id)
+        assert event["event_type"]       == "agent_boundary_violation"
+        assert event["boundary_violated"] in (True, 1)
+        assert event["status"]           == "violation"
+        assert "DDL_ATTEMPT" in event["risk_flags"]
+
+    def test_agent_boundary_violation_always_stored(self, ledger, alice_identity):
+        """Violations must always be stored, even in degraded mode (best-effort write)."""
+        # Emit a violation — should return a valid trace_id
+        trace_id = ledger.emit_agent_boundary_violation(
+            identity          = alice_identity,
+            request_id        = "req-agent-003",
+            agent_name        = "rag_agent",
+            violation_summary = "Agent accessed schema outside allowed list",
+        )
+        assert len(trace_id) == 36
+        event = ledger.get_event(trace_id)
+        assert event is not None
+        assert event["event_type"] == "agent_boundary_violation"
+
+    def test_search_boundary_violations(self, sqlite_backend, alice_identity):
+        """Auditors must be able to search for all boundary violations."""
+        # Add one violation and one normal event
+        violation = TraceEvent.new(
+            identity          = alice_identity,
+            event_type        = EventType.AGENT_BOUNDARY_VIOLATION,
+            boundary_violated = True,
+            status            = TraceStatus.VIOLATION,
+        )
+        normal = TraceEvent.new(
+            identity   = alice_identity,
+            event_type = EventType.AGENT_ACTION,
+        )
+        sqlite_backend.append(violation.to_dict())
+        sqlite_backend.append(normal.to_dict())
+
+        # Search for violations by event_type
+        rows = sqlite_backend.search(
+            tenant_id  = "acme",
+            event_type = "agent_boundary_violation",
+        )
+        assert len(rows) == 1
+        assert rows[0]["event_type"] == "agent_boundary_violation"
 
 
 # ── Thread-safety test ────────────────────────────────────────────────────────

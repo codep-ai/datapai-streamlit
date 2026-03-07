@@ -51,14 +51,21 @@ summary as (
         -- Distinct SQL patterns
         count(distinct sql_hash)               as distinct_sql_hashes,
 
+        -- Sensitivity / PII profile
+        count_if(sensitivity_level = 'CRITICAL') as critical_sensitivity_count,
+        count_if(sensitivity_level = 'HIGH')     as high_sensitivity_count,
+        count_if(pii_detected = true)            as pii_event_count,
+
         -- Human corrections
         count_if(is_human_correction)          as human_corrections,
 
-        -- Risk level
+        -- Risk level (accounts for sensitivity and PII)
         case
-            when count_if(event_type = 'sql_blocked') > 5  then 'HIGH'
-            when count_if(event_type = 'sql_blocked') > 0  then 'MEDIUM'
-            when count_if(is_error)                   > 0  then 'LOW'
+            when count_if(event_type = 'sql_blocked') > 5    then 'HIGH'
+            when count_if(event_type = 'sql_blocked') > 0    then 'MEDIUM'
+            when count_if(sensitivity_level = 'CRITICAL') > 0 then 'MEDIUM'
+            when count_if(pii_detected = true) > 0            then 'MEDIUM'
+            when count_if(is_error)                   > 0    then 'LOW'
             else 'NONE'
         end                                    as risk_level
 
