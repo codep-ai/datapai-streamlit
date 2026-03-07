@@ -6,7 +6,7 @@
 }}
 
 /*
-  fct_sql_generations
+  fct_ai_sql_generations
 
   One row per SQL generation event (event_type = 'sql_generated').
   Event-grain fact table for SQL audit and risk analysis.
@@ -17,9 +17,9 @@
     sensitivity_level, pii_detected, pii_fields — data risk classification
 
   Foreign keys:
-    tenant_id + user_id         → dim_users
-    tenant_id + datasource_name → dim_datasources
-    tenant_id + model_name      → dim_models
+    tenant_id + user_id         → dim_ai_users
+    tenant_id + datasource_name → dim_ai_datasources
+    tenant_id + model_name      → dim_ai_models
 */
 
 with sql_events as (
@@ -58,11 +58,11 @@ select
     -- What the model decided / did
     ai_action_summary,
 
-    -- Datasource context (FK → dim_datasources)
+    -- Datasource context (FK → dim_ai_datasources)
     datasource_type,
     datasource_name,
 
-    -- Model used (FK → dim_models)
+    -- Model used (FK → dim_ai_models)
     model_name,
 
     -- Derived risk level for this SQL

@@ -6,7 +6,7 @@
 }}
 
 /*
-  fct_policy_checks
+  fct_ai_policy_checks
 
   One row per governance policy check event.
   Includes both passed and failed/blocked checks.

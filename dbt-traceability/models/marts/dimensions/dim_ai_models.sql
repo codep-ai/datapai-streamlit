@@ -6,7 +6,7 @@
 }}
 
 /*
-  dim_models
+  dim_ai_models
 
   One row per (tenant_id, model_name).
   Tracks LLM model usage, quality, and risk profile across the platform.

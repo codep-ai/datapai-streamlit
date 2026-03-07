@@ -6,7 +6,7 @@
 }}
 
 /*
-  dim_workspaces
+  dim_ai_workspaces
 
   One row per (tenant_id, workspace_id).
   Aggregates activity and risk profile across the workspace lifetime.

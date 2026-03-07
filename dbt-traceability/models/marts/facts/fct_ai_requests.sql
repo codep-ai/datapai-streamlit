@@ -24,10 +24,10 @@
     boundary_violated   — any agent boundary violation
 
   Foreign keys:
-    tenant_id + user_id         → dim_users
-    tenant_id + workspace_id    → dim_workspaces
+    tenant_id + user_id         → dim_ai_users
+    tenant_id + workspace_id    → dim_ai_workspaces
     tenant_id + datasources_touched (multi-value, denormalised)
-    tenant_id + primary_model   → dim_models
+    tenant_id + primary_model   → dim_ai_models
 */
 
 select

@@ -6,7 +6,7 @@
 }}
 
 /*
-  fct_sql_executions
+  fct_ai_sql_executions
 
   One row per SQL execution event (event_type = 'sql_executed').
   Audit trail for every query that actually ran against a datasource.
@@ -15,7 +15,7 @@
     sql_text — exact SQL that ran (NOT result rows — data never stored)
     This table is the definitive record for data access audits.
 
-  Note: A SQL may appear in fct_sql_generations but NOT here (if blocked).
+  Note: A SQL may appear in fct_ai_sql_generations but NOT here (if blocked).
         Compliance auditors should join both tables to see generation vs execution.
 */
 
@@ -52,11 +52,11 @@ select
     pii_detected,
     pii_fields,
 
-    -- Datasource context (FK → dim_datasources)
+    -- Datasource context (FK → dim_ai_datasources)
     datasource_type,
     datasource_name,
 
-    -- Model that generated this SQL (FK → dim_models)
+    -- Model that generated this SQL (FK → dim_ai_models)
     model_name,
 
     -- Governance

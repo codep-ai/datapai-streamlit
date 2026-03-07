@@ -3,7 +3,7 @@ version: 2
 # ── DIMENSION TABLES ──────────────────────────────────────────────────────────
 
 models:
-  - name: dim_users
+  - name: dim_ai_users
     description: >
       One row per (tenant_id, user_id). Lifetime activity and risk profile for
       each user. Use as a Lightdash dimension table to drill into per-user behaviour.
@@ -51,7 +51,7 @@ models:
           dimension:
             type: timestamp
 
-  - name: dim_workspaces
+  - name: dim_ai_workspaces
     description: >
       One row per (tenant_id, workspace_id). Workspace-level activity and risk
       profile. Use for cross-workspace governance comparison in Lightdash.
@@ -85,7 +85,7 @@ models:
               type: sum
               label: "Boundary Violations"
 
-  - name: dim_datasources
+  - name: dim_ai_datasources
     description: >
       One row per (tenant_id, datasource_name). Usage and risk profile per
       connected datasource. Use to see which datasources carry the most risk.
@@ -119,7 +119,7 @@ models:
               type: sum
               label: "PII Events"
 
-  - name: dim_models
+  - name: dim_ai_models
     description: >
       One row per (tenant_id, model_name). LLM model usage, quality, and risk
       profile. Use for model-level compliance and cost tracking.
@@ -163,9 +163,9 @@ models:
       sql_executed_text) and agentic audit fields (boundary_violated, agent_actions_taken).
 
       Join to:
-        dim_users       on tenant_id + user_id
-        dim_workspaces  on tenant_id + workspace_id
-        dim_models      on tenant_id + primary_model
+        dim_ai_users       on tenant_id + user_id
+        dim_ai_workspaces  on tenant_id + workspace_id
+        dim_ai_models      on tenant_id + primary_model
     meta:
       label: "AI Requests"
       group_label: "Traceability — Facts"
@@ -220,15 +220,15 @@ models:
               type: sum
               label: "Total Policy Blocks"
 
-  - name: fct_sql_generations
+  - name: fct_ai_sql_generations
     description: >
       One row per SQL generation event. Event-grain fact table for SQL audit
       and risk analysis. Verbatim sql_text stored for regulatory compliance.
 
       Join to:
-        dim_users        on tenant_id + user_id
-        dim_datasources  on tenant_id + datasource_name
-        dim_models       on tenant_id + model_name
+        dim_ai_users        on tenant_id + user_id
+        dim_ai_datasources  on tenant_id + datasource_name
+        dim_ai_models       on tenant_id + model_name
     meta:
       label: "SQL Generations"
       group_label: "Traceability — Facts"
@@ -264,14 +264,14 @@ models:
               sql: "case when ${pii_detected} = true then ${trace_id} end"
               label: "SQL Generations with PII"
 
-  - name: fct_sql_executions
+  - name: fct_ai_sql_executions
     description: >
       One row per SQL execution event. Definitive data access audit log.
       sql_text is the exact query that ran — never the result data.
 
       Join to:
-        dim_users        on tenant_id + user_id
-        dim_datasources  on tenant_id + datasource_name
+        dim_ai_users        on tenant_id + user_id
+        dim_ai_datasources  on tenant_id + datasource_name
     meta:
       label: "SQL Executions"
       group_label: "Traceability — Facts"
@@ -291,7 +291,7 @@ models:
           dimension:
             type: date
 
-  - name: fct_policy_checks
+  - name: fct_ai_policy_checks
     description: >
       One row per governance policy check, including passed, blocked, and
       boundary violation events. Core table for compliance enforcement audit.
@@ -365,7 +365,7 @@ models:
           dimension:
             type: date
 
-  - name: fct_rag_retrievals
+  - name: fct_ai_rag_retrievals
     description: >
       One row per RAG chunk lookup or memory retrieval.
       Tracks what context was retrieved for each request, which datasource

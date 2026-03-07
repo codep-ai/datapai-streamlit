@@ -6,7 +6,7 @@
 }}
 
 /*
-  dim_datasources
+  dim_ai_datasources
 
   One row per (tenant_id, datasource_name).
   Tracks every datasource connected to the platform with usage and risk profile.

@@ -6,7 +6,7 @@
 }}
 
 /*
-  fct_rag_retrievals
+  fct_ai_rag_retrievals
 
   One row per RAG (Retrieval-Augmented Generation) or memory retrieval event.
   Covers rag_retrieved and memory_retrieved events.

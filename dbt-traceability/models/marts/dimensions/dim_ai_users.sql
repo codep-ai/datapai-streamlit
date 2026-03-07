@@ -6,7 +6,7 @@
 }}
 
 /*
-  dim_users
+  dim_ai_users
 
   One row per (tenant_id, user_id).
   Aggregates lifetime activity for each user across all workspaces.
