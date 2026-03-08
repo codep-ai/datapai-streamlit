@@ -1,0 +1,65 @@
+name: datapai_traceability
+profile: datapai_snowflake
+config-version: 2
+version: "1.0"
+
+require-dbt-version: ">=1.0.7"
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+packages-install-path: dbt_packages
+target-path: "target"
+clean-targets:
+  - "target"
+
+models:
+  datapai_traceability:
+    staging:
+      +schema: trace_staging
+      +materialized: view
+      +tags:
+        - "traceability"
+        - "governance"
+    intermediate:
+      +schema: trace_intermediate
+      +materialized: table
+      +tags:
+        - "traceability"
+        - "governance"
+    reporting:
+      +schema: trace_reporting
+      +materialized: table
+      +tags:
+        - "traceability"
+        - "governance"
+        - "published"
+    marts:
+      +schema: trace_marts
+      +materialized: table
+      dimensions:
+        +tags:
+          - "traceability"
+          - "marts"
+          - "dimension"
+      facts:
+        +tags:
+          - "traceability"
+          - "marts"
+          - "fact"
+
+tests:
+  +store_failures: true
+  +schema: trace_test_audit
+  +limit: 1000
+
+vars:
+  # Snowflake raw schema where the Python backend writes trace events
+  # Must match SNOWFLAKE_SCHEMA env var used by SnowflakeTraceLedgerBackend
+  trace_raw_schema: "DATAPAI_TRACES"
+  trace_raw_table: "DATAPAI_TRACE_EVENTS"
+  # Lookback window for time-windowed reporting models (days)
+  trace_lookback_days: 30

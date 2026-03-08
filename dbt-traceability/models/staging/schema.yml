@@ -1,0 +1,43 @@
+version: 2
+
+models:
+  - name: stg_trace_events
+    description: >
+      Staged trace events — cast types, quality-filtered, with derived
+      convenience columns (is_sql_event, is_error, is_policy_blocked).
+      Single entry point for all downstream traceability models.
+    columns:
+      - name: trace_id
+        description: "Primary key — UUID for this event."
+        tests:
+          - unique
+          - not_null
+      - name: event_timestamp
+        description: "Parsed UTC timestamp."
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: user_id
+        tests:
+          - not_null
+      - name: session_id
+        tests:
+          - not_null
+      - name: event_type
+        tests:
+          - not_null
+      - name: status
+        tests:
+          - not_null
+          - accepted_values:
+              values: [ok, blocked, failed, pending]
+      - name: is_sql_event
+        description: "True for sql_generated | sql_validated | sql_blocked | sql_executed."
+      - name: is_error
+        description: "True when status is failed or blocked."
+      - name: is_policy_blocked
+        description: "True when a governance policy blocked the action."
+      - name: is_human_correction
+        description: "True for human_feedback_received events."

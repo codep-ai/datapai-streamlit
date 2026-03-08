@@ -1,0 +1,136 @@
+version: 2
+
+models:
+  - name: rpt_request_summary
+    description: >
+      One row per (tenant_id, request_id) — summarises every user request
+      including SQL activity, governance decisions, risk level, and the
+      first question + final response (summarised, no PII).
+    meta:
+      label: "Request Summary"
+      group_label: "Traceability"
+    columns:
+      - name: request_id
+        description: "Primary key for a single user request."
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: risk_level
+        description: "Derived risk: NONE | LOW | MEDIUM | HIGH"
+        tests:
+          - accepted_values:
+              values: [NONE, LOW, MEDIUM, HIGH]
+        meta:
+          dimension:
+            type: string
+      - name: request_started_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: total_request_ms
+        description: "Total request duration in milliseconds."
+        meta:
+          dimension:
+            type: number
+      - name: user_question_summary
+        description: "Redacted summary of the user question."
+      - name: primary_model
+        description: "Main LLM model used for this request."
+      - name: sql_blocked_count
+        meta:
+          metrics:
+            total_sql_blocked:
+              type: sum
+              label: "Total SQL Blocked"
+
+  - name: rpt_policy_violations
+    description: >
+      All policy-blocked and failed events with full context.
+      Used for governance review and compliance audit export.
+    meta:
+      label: "Policy Violations"
+      group_label: "Traceability"
+    columns:
+      - name: trace_id
+        tests:
+          - not_null
+      - name: violation_type
+        description: "SQL_BLOCKED | POLICY_FAILED | ACTION_BLOCKED | ACTION_FAILED"
+        tests:
+          - accepted_values:
+              values: [SQL_BLOCKED, POLICY_FAILED, ACTION_BLOCKED, ACTION_FAILED, UNKNOWN]
+        meta:
+          dimension:
+            type: string
+      - name: violation_date
+        meta:
+          dimension:
+            type: date
+
+  - name: rpt_sql_risk_summary
+    description: >
+      Aggregated SQL risk profile per datasource and user per day.
+      Shows block rates, distinct SQL patterns, and risk levels.
+    meta:
+      label: "SQL Risk Summary"
+      group_label: "Traceability"
+    columns:
+      - name: risk_level
+        tests:
+          - accepted_values:
+              values: [NONE, LOW, MEDIUM, HIGH]
+      - name: block_rate_pct
+        description: "Percentage of generated SQL that was blocked."
+        meta:
+          metrics:
+            avg_block_rate:
+              type: average
+              label: "Avg SQL Block Rate %"
+
+  - name: rpt_model_usage
+    description: >
+      LLM model usage breakdown per tenant, workspace, user, and day.
+    meta:
+      label: "Model Usage"
+      group_label: "Traceability"
+    columns:
+      - name: model_name
+        tests:
+          - not_null
+      - name: invocations
+        meta:
+          metrics:
+            total_invocations:
+              type: sum
+              label: "Total Model Invocations"
+
+  - name: rpt_session_overview
+    description: >
+      One row per session — used for the governance console and
+      Lightdash "Session Overview" dashboard.
+    meta:
+      label: "Session Overview"
+      group_label: "Traceability"
+    columns:
+      - name: session_id
+        tests:
+          - not_null
+      - name: session_risk_level
+        tests:
+          - accepted_values:
+              values: [NONE, LOW, MEDIUM, HIGH]
+        meta:
+          dimension:
+            type: string
+      - name: session_started_at
+        meta:
+          dimension:
+            type: timestamp
+      - name: total_requests
+        meta:
+          metrics:
+            total_requests_sum:
+              type: sum
+              label: "Total Requests"

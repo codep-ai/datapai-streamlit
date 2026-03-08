@@ -1,0 +1,42 @@
+version: 2
+
+models:
+  - name: int_request_timeline
+    description: >
+      One row per (request_id, event) with cumulative timing and derived flags.
+      Ordered timeline for a single user request — feeds reporting models
+      and the Streamlit trace viewer.
+    columns:
+      - name: trace_id
+        tests:
+          - unique
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: request_id
+        tests:
+          - not_null
+      - name: event_sequence
+        description: "1-based sequential order of events within a request."
+      - name: total_request_ms
+        description: "Total duration of the request in milliseconds."
+      - name: ms_since_request_start
+        description: "Milliseconds elapsed since the first event in this request."
+
+  - name: int_session_summary
+    description: >
+      One row per (tenant_id, session_id) summarising all activity.
+      Used by admin governance console and Lightdash session dashboards.
+    columns:
+      - name: session_id
+        tests:
+          - not_null
+      - name: tenant_id
+        tests:
+          - not_null
+      - name: session_risk_level
+        description: "Derived risk: NONE | LOW | MEDIUM | HIGH"
+        tests:
+          - accepted_values:
+              values: [NONE, LOW, MEDIUM, HIGH]

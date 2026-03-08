@@ -1,0 +1,1733 @@
+version: 2
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DATAP.AI — AI TRACEABILITY MART: Star Schema
+# ───────────────────────────────────────────────────────────────────────────────
+# Schema: trace_marts   (Snowflake)
+# Lightdash group: "Traceability — Dimensions" / "Traceability — Facts"
+#
+# PURPOSE
+#   These tables are operational and compliance-focused — they describe what the
+#   AI platform did, not what the business data contains. They are NOT standard
+#   enterprise business dimensions (e.g. there is no CRM "Users" table here).
+#   The "_ai_" prefix in every table name makes this explicit.
+#
+# LAYER DESIGN
+#   Raw ledger:   DATAPAI_TRACES.DATAPAI_TRACE_EVENTS   (append-only, immutable)
+#   Staging:      trace_staging.stg_trace_events         (typed, flags derived)
+#   Reporting:    trace_reporting.rpt_*                  (compliance audit export)
+#   Marts (here): trace_marts.dim_ai_* / fct_ai_*       (star schema for Lightdash)
+#
+# STAR SCHEMA — JOIN MAP
+#
+#   dim_ai_users ◄──────────────────── tenant_id + user_id
+#   dim_ai_workspaces ◄─────────────── tenant_id + workspace_id
+#   dim_ai_datasources ◄────────────── tenant_id + datasource_name
+#   dim_ai_models ◄─────────────────── tenant_id + model_name
+#        │                   │                  │              │
+#        └───────────────────┴──────────────────┴──────────────┘
+#                            │
+#              fct_ai_requests          (request grain)
+#              fct_ai_sql_generations   (event grain — SQL audit)
+#              fct_ai_sql_executions    (event grain — data access log)
+#              fct_ai_policy_checks     (event grain — governance log)
+#              fct_ai_tool_calls        (event grain — agent/tool audit)
+#              fct_ai_rag_retrievals    (event grain — context retrieval)
+#
+# COMPLIANCE FIELDS (present in multiple fact tables)
+#   question_text     — verbatim user question; required by SOX, MiFID II, APRA
+#   sql_text          — exact SQL query; required for data access audit
+#   sensitivity_level — LOW | MEDIUM | HIGH | CRITICAL
+#   pii_detected      — boolean flag for PII presence
+#   pii_fields        — JSON list of PII column names (names only, never values)
+#   boundary_violated — AI agent exceeded allowed scope
+#   risk_flags        — JSON list of detected security/compliance risks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ── DIMENSION TABLES ──────────────────────────────────────────────────────────
+
+models:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: dim_ai_users
+    description: >
+      One row per (tenant_id, user_id). Lifetime AI activity and risk profile
+      for each platform user.
+
+      PURPOSE: answers "who is using the AI, how much, and how riskily?"
+      Not a CRM or HR user table — only AI interaction behaviour is recorded here.
+
+      Grain: one row per unique user within a tenant (not per workspace — a user
+      who spans multiple workspaces gets one combined row per workspace).
+
+      Relationships:
+        → fct_ai_requests        join on tenant_id + user_id
+        → fct_ai_sql_generations join on tenant_id + user_id
+        → fct_ai_sql_executions  join on tenant_id + user_id
+        → fct_ai_policy_checks   join on tenant_id + user_id
+        → fct_ai_tool_calls      join on tenant_id + user_id
+    meta:
+      label: "AI Users"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: tenant_id
+        description: >
+          Tenant / organisation identifier. Primary scope for all data isolation.
+          All queries MUST filter by tenant_id to prevent cross-tenant data leakage.
+        tests:
+          - not_null
+      - name: workspace_id
+        description: >
+          Workspace within the tenant where this user is primarily active.
+          A user may appear in multiple workspaces; each gets its own row.
+        tests:
+          - not_null
+      - name: user_id
+        description: >
+          Unique user identifier from the authentication system (e.g. SSO subject,
+          email, or UUID). This is the AI platform user ID, not a business entity ID.
+        tests:
+          - not_null
+      - name: first_seen_at
+        description: >
+          UTC timestamp of the first trace event recorded for this user.
+          Equivalent to the user's first AI interaction on this platform.
+        meta:
+          dimension:
+            type: timestamp
+      - name: last_seen_at
+        description: >
+          UTC timestamp of the most recent trace event for this user.
+          Use to identify inactive users or detect unusual activity timing.
+        meta:
+          dimension:
+            type: timestamp
+      - name: total_sessions
+        description: >
+          Count of distinct AI conversation sessions this user has started.
+          One session = one continuous conversation thread in the UI.
+        meta:
+          metrics:
+            total_user_sessions:
+              type: sum
+              label: "Total Sessions"
+      - name: total_requests
+        description: >
+          Total number of questions/requests the user has submitted to the AI.
+          One request = one question → AI response cycle within a session.
+        meta:
+          metrics:
+            total_user_requests:
+              type: sum
+              label: "Total Requests"
+      - name: total_events
+        description: >
+          Total count of raw trace events attributed to this user across all
+          sessions. Higher than total_requests because each request generates
+          multiple events (SQL generation, policy check, model invoked, etc.).
+      - name: sql_generated_count
+        description: >
+          Number of SQL queries the AI generated in response to this user's
+          questions. Includes queries that were later blocked.
+        meta:
+          metrics:
+            total_sql_generated_by_user:
+              type: sum
+              label: "SQL Generated"
+      - name: sql_executed_count
+        description: >
+          Number of SQL queries that were approved by policy and actually
+          executed against a datasource on behalf of this user.
+        meta:
+          metrics:
+            total_sql_executed_by_user:
+              type: sum
+              label: "SQL Executed"
+      - name: sql_blocked_count
+        description: >
+          Number of SQL queries blocked by the governance policy engine before
+          execution. High values indicate the user is asking questions the AI
+          cannot safely answer within current policy rules.
+        meta:
+          metrics:
+            total_sql_blocked_by_user:
+              type: sum
+              label: "SQL Blocked"
+      - name: agent_events
+        description: >
+          Number of autonomous AI agent actions taken while serving this user's
+          requests (e.g. tool calls, file ingestion, schema inspection).
+        meta:
+          metrics:
+            total_agent_events_by_user:
+              type: sum
+              label: "Agent Events"
+      - name: boundary_violations
+        description: >
+          Number of times an AI agent exceeded its allowed scope while
+          processing this user's requests — e.g. attempted DDL, accessed
+          restricted schemas, or tried cross-tenant operations.
+          Any non-zero value should trigger a security review.
+        meta:
+          metrics:
+            total_boundary_violations_by_user:
+              type: sum
+              label: "Boundary Violations"
+      - name: high_sensitivity_events
+        description: >
+          Number of events classified as HIGH or CRITICAL sensitivity for
+          this user. Indicates how frequently this user accesses sensitive data.
+        meta:
+          metrics:
+            total_high_sensitivity_by_user:
+              type: sum
+              label: "High Sensitivity Events"
+      - name: pii_events
+        description: >
+          Number of events where PII (Personally Identifiable Information) was
+          detected in queries or content associated with this user's requests.
+        meta:
+          metrics:
+            total_pii_events_by_user:
+              type: sum
+              label: "PII Events"
+      - name: policy_blocks
+        description: >
+          Total number of governance policy checks that blocked an action for
+          this user, across all event types (SQL, agent, tool, etc.).
+        meta:
+          metrics:
+            total_policy_blocks_by_user:
+              type: sum
+              label: "Policy Blocks"
+      - name: highest_sensitivity_seen
+        description: >
+          The most sensitive data classification level this user has ever
+          accessed on the platform. Derived across all events.
+          Values: LOW → MEDIUM → HIGH → CRITICAL.
+          CRITICAL = user has accessed regulated/PII/classified data.
+        meta:
+          dimension:
+            type: string
+      - name: user_risk_tier
+        description: >
+          Overall risk classification for this user, derived from their full
+          activity history:
+            CRITICAL — at least one agent boundary violation exists
+            HIGH     — at least one SQL query was blocked
+            MEDIUM   — policy blocks, high sensitivity data, or PII access
+            LOW      — no significant risk events recorded
+          Use this field to prioritise security reviews.
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: dim_ai_workspaces
+    description: >
+      One row per (tenant_id, workspace_id). AI activity and risk profile
+      aggregated at the workspace level.
+
+      PURPOSE: answers "which workspaces are active, what tools do they use,
+      and what is their collective risk posture?"
+
+      Grain: one row per workspace within a tenant.
+
+      Relationships:
+        → fct_ai_requests      join on tenant_id + workspace_id
+        → fct_ai_tool_calls    join on tenant_id + workspace_id
+        → dim_ai_users         same tenant_id scope
+    meta:
+      label: "AI Workspaces"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: tenant_id
+        description: "Tenant / organisation identifier. All queries must filter by this first."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: >
+          Unique workspace identifier within the tenant. Workspaces are logical
+          groupings of users and datasources within an organisation (e.g.
+          "finance", "analytics", "data-engineering").
+        tests:
+          - not_null
+      - name: first_active_at
+        description: "UTC timestamp of the first AI activity recorded in this workspace."
+        meta:
+          dimension:
+            type: timestamp
+      - name: last_active_at
+        description: "UTC timestamp of the most recent AI activity in this workspace."
+        meta:
+          dimension:
+            type: timestamp
+      - name: distinct_users
+        description: >
+          Number of unique users who have used the AI within this workspace.
+          A proxy for workspace adoption level.
+        meta:
+          metrics:
+            total_workspace_users:
+              type: sum
+              label: "Total Users"
+      - name: total_sessions
+        description: "Total AI conversation sessions across all users in this workspace."
+        meta:
+          metrics:
+            total_workspace_sessions:
+              type: sum
+              label: "Total Sessions"
+      - name: total_requests
+        description: "Total AI requests submitted from this workspace by all users."
+        meta:
+          metrics:
+            total_workspace_requests:
+              type: sum
+              label: "Total Requests"
+      - name: distinct_models_used
+        description: "Number of distinct LLM models invoked within this workspace."
+      - name: models_used
+        description: >
+          Comma-separated list of LLM model names used in this workspace.
+          Example: "claude-sonnet-4-6, gpt-4o".
+      - name: distinct_datasources
+        description: "Number of distinct datasources accessed from this workspace."
+      - name: datasources_accessed
+        description: >
+          Comma-separated list of datasource connection aliases accessed from
+          this workspace. Example: "snowflake_prod, analytics_db".
+      - name: sql_generated
+        description: "Total SQL queries generated by AI for users in this workspace."
+        meta:
+          metrics:
+            total_workspace_sql_generated:
+              type: sum
+              label: "SQL Generated"
+      - name: sql_executed
+        description: "Total SQL queries that executed against datasources from this workspace."
+        meta:
+          metrics:
+            total_workspace_sql_executed:
+              type: sum
+              label: "SQL Executed"
+      - name: sql_blocked
+        description: >
+          Total SQL queries blocked by governance policy from this workspace.
+          High counts may indicate overly permissive user questions or
+          a need to tune policy rules.
+        meta:
+          metrics:
+            total_workspace_sql_blocked:
+              type: sum
+              label: "SQL Blocked"
+      - name: agent_events
+        description: "Total autonomous AI agent actions across all users in this workspace."
+        meta:
+          metrics:
+            total_workspace_agent_events:
+              type: sum
+              label: "Agent Events"
+      - name: boundary_violations
+        description: >
+          Number of agent boundary violations in this workspace. Any non-zero
+          value requires security investigation — an agent exceeded its
+          allowed operational scope.
+        meta:
+          metrics:
+            workspace_boundary_violations:
+              type: sum
+              label: "Boundary Violations"
+      - name: high_sensitivity_events
+        description: "Events classified HIGH or CRITICAL sensitivity in this workspace."
+        meta:
+          metrics:
+            total_workspace_high_sensitivity:
+              type: sum
+              label: "High Sensitivity Events"
+      - name: pii_events
+        description: "Events where PII was detected in queries from this workspace."
+        meta:
+          metrics:
+            total_workspace_pii_events:
+              type: sum
+              label: "PII Events"
+      - name: policy_blocks
+        description: "Total policy-blocked actions from this workspace."
+        meta:
+          metrics:
+            total_workspace_policy_blocks:
+              type: sum
+              label: "Policy Blocks"
+      - name: workspace_risk_tier
+        description: >
+          Overall risk classification for this workspace:
+            CRITICAL — at least one agent boundary violation
+            HIGH     — SQL queries were blocked
+            MEDIUM   — policy blocks, high sensitivity data, or PII detected
+            LOW      — no significant risk events
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: dim_ai_datasources
+    description: >
+      One row per (tenant_id, workspace_id, datasource_name). Usage and risk
+      profile for every data connection accessed via the AI platform.
+
+      PURPOSE: answers "which databases are being queried by AI, how often,
+      by whom, and do they contain sensitive or PII data?"
+
+      Grain: one row per (tenant, workspace, datasource) combination.
+      A datasource used in two workspaces gets two rows.
+
+      Relationships:
+        → fct_ai_sql_generations  join on tenant_id + datasource_name
+        → fct_ai_sql_executions   join on tenant_id + datasource_name
+        → fct_ai_tool_calls       join on tenant_id + datasource_name
+    meta:
+      label: "AI Datasources"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: tenant_id
+        description: "Tenant / organisation identifier. Datasource names are scoped per tenant."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where this datasource is primarily used."
+        tests:
+          - not_null
+      - name: datasource_type
+        description: >
+          Technology type of the datasource connection. Values typically include:
+          snowflake, bigquery, redshift, duckdb, sqlite, postgresql, mysql.
+          Used to understand which database engines are involved in AI queries.
+        meta:
+          dimension:
+            type: string
+      - name: datasource_name
+        description: >
+          Human-readable connection alias as configured in the platform
+          (e.g. "snowflake_prod", "analytics_db", "hr_warehouse").
+          This is the name users and agents reference — not the host/URL.
+        tests:
+          - not_null
+      - name: first_accessed_at
+        description: "UTC timestamp when the AI platform first queried this datasource."
+        meta:
+          dimension:
+            type: timestamp
+      - name: last_accessed_at
+        description: "UTC timestamp of the most recent AI query against this datasource."
+        meta:
+          dimension:
+            type: timestamp
+      - name: distinct_users
+        description: >
+          Number of unique users whose AI requests have touched this datasource.
+          High counts indicate a widely-used shared datasource.
+        meta:
+          metrics:
+            datasource_distinct_users:
+              type: sum
+              label: "Distinct Users"
+      - name: distinct_sessions
+        description: "Number of distinct AI sessions that accessed this datasource."
+      - name: distinct_requests
+        description: "Number of distinct user requests that queried this datasource."
+        meta:
+          metrics:
+            datasource_distinct_requests:
+              type: sum
+              label: "Distinct Requests"
+      - name: sql_generated
+        description: "Number of SQL queries generated by AI that targeted this datasource."
+        meta:
+          metrics:
+            datasource_sql_generated:
+              type: sum
+              label: "SQL Generated"
+      - name: sql_executed
+        description: >
+          Number of SQL queries that successfully executed on this datasource.
+          Compare with sql_generated to calculate the execution rate.
+        meta:
+          metrics:
+            total_sql_executions:
+              type: sum
+              label: "SQL Executed"
+      - name: sql_blocked
+        description: >
+          Number of SQL queries blocked before reaching this datasource.
+          Indicates how many queries the governance policy prevented from
+          running on this connection.
+        meta:
+          metrics:
+            datasource_sql_blocked:
+              type: sum
+              label: "SQL Blocked"
+      - name: distinct_sql_patterns
+        description: >
+          Count of unique SQL fingerprints (sql_hash) targeting this datasource.
+          High counts indicate exploratory/diverse access patterns; low counts
+          indicate repetitive templated queries.
+        meta:
+          metrics:
+            datasource_sql_patterns:
+              type: sum
+              label: "Distinct SQL Patterns"
+      - name: agent_events
+        description: "Number of autonomous agent actions that accessed this datasource."
+        meta:
+          metrics:
+            datasource_agent_events:
+              type: sum
+              label: "Agent Events"
+      - name: boundary_violations
+        description: >
+          Number of agent boundary violations specifically involving this
+          datasource — e.g. an agent attempted to access restricted tables,
+          run DDL, or cross tenant boundaries on this connection.
+        meta:
+          metrics:
+            datasource_boundary_violations:
+              type: sum
+              label: "Boundary Violations"
+      - name: critical_events
+        description: "Events classified CRITICAL sensitivity on this datasource."
+        meta:
+          metrics:
+            datasource_critical_events:
+              type: sum
+              label: "Critical Sensitivity Events"
+      - name: high_sensitivity_events
+        description: "Events classified HIGH sensitivity on this datasource."
+        meta:
+          metrics:
+            datasource_high_sensitivity:
+              type: sum
+              label: "High Sensitivity Events"
+      - name: pii_events
+        description: >
+          Events where PII was detected in queries targeting this datasource.
+          High counts indicate this datasource contains or exposes personal data.
+        meta:
+          metrics:
+            total_pii_events:
+              type: sum
+              label: "PII Events"
+      - name: datasource_risk_tier
+        description: >
+          Risk classification for this datasource, based on the worst event
+          recorded against it:
+            CRITICAL — agent boundary violations on this datasource
+            HIGH     — SQL blocked or HIGH sensitivity queries run against it
+            MEDIUM   — PII detected in queries
+            LOW      — no significant risk events
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: dim_ai_models
+    description: >
+      One row per (tenant_id, workspace_id, model_name). Usage, quality, and
+      risk profile for each LLM model deployed on the platform.
+
+      PURPOSE: answers "which AI models are used, how reliably do they perform,
+      how often do humans need to correct them, and are they associated with
+      high-risk outputs?"
+
+      Grain: one row per model per workspace per tenant.
+
+      Relationships:
+        → fct_ai_sql_generations  join on tenant_id + model_name
+        → fct_ai_requests         join on tenant_id + primary_model
+        → fct_ai_tool_calls       join on tenant_id + model_name
+    meta:
+      label: "AI Models"
+      group_label: "Traceability — Dimensions"
+    columns:
+      - name: tenant_id
+        description: "Tenant / organisation identifier."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where this model is used."
+        tests:
+          - not_null
+      - name: model_name
+        description: >
+          LLM model identifier as reported by the model provider.
+          Examples: "claude-sonnet-4-6", "claude-haiku-3-5", "gpt-4o".
+          Used for cost attribution, compliance (which model made which decision),
+          and comparative quality analysis.
+        tests:
+          - not_null
+      - name: first_used_at
+        description: "UTC timestamp when this model was first invoked on the platform."
+        meta:
+          dimension:
+            type: timestamp
+      - name: last_used_at
+        description: "UTC timestamp of the most recent invocation of this model."
+        meta:
+          dimension:
+            type: timestamp
+      - name: distinct_users
+        description: "Number of unique users whose requests have been served by this model."
+        meta:
+          metrics:
+            model_distinct_users:
+              type: sum
+              label: "Distinct Users"
+      - name: distinct_sessions
+        description: "Number of distinct AI sessions in which this model was invoked."
+      - name: distinct_requests
+        description: "Number of distinct user requests handled (at least partially) by this model."
+        meta:
+          metrics:
+            model_distinct_requests:
+              type: sum
+              label: "Distinct Requests"
+      - name: total_invocations
+        description: >
+          Total number of times this model was called (one request may invoke
+          the model multiple times via chain-of-thought or multi-step reasoning).
+        meta:
+          metrics:
+            total_model_invocations:
+              type: sum
+              label: "Total Invocations"
+      - name: sql_generated
+        description: "Number of SQL queries generated by this model."
+        meta:
+          metrics:
+            model_sql_generated:
+              type: sum
+              label: "SQL Generated"
+      - name: sql_blocked
+        description: >
+          Number of SQL queries generated by this model that were subsequently
+          blocked by the governance policy. A high ratio vs sql_generated may
+          indicate this model tends toward unsafe or overly broad queries.
+        meta:
+          metrics:
+            model_sql_blocked:
+              type: sum
+              label: "SQL Blocked"
+      - name: human_corrections
+        description: >
+          Number of times a human user corrected or overrode this model's output
+          (captured as human_feedback_received events). High counts indicate the
+          model requires more tuning or fine-tuning for this tenant's use case.
+        meta:
+          metrics:
+            total_human_corrections:
+              type: sum
+              label: "Human Corrections"
+      - name: error_events
+        description: >
+          Number of invocation errors for this model (failed API calls,
+          context overflow, timeout, etc.).
+        meta:
+          metrics:
+            model_error_events:
+              type: sum
+              label: "Error Events"
+      - name: error_rate_pct
+        description: >
+          Percentage of invocations that resulted in an error.
+          Calculated as: (error_events / total_invocations) × 100.
+          High values indicate reliability issues with this model.
+        meta:
+          metrics:
+            avg_model_error_rate:
+              type: average
+              label: "Avg Error Rate %"
+      - name: boundary_violations
+        description: >
+          Number of agent boundary violations associated with this model.
+          Non-zero values should be reviewed — the model may be generating
+          instructions that cause agents to exceed their allowed scope.
+        meta:
+          metrics:
+            model_boundary_violations:
+              type: sum
+              label: "Boundary Violations"
+      - name: critical_sensitivity_events
+        description: >
+          Events where this model produced output classified as CRITICAL
+          sensitivity. Indicates the model is being used on the most
+          restricted/regulated data.
+        meta:
+          metrics:
+            model_critical_sensitivity:
+              type: sum
+              label: "Critical Sensitivity Events"
+      - name: pii_events
+        description: "Events where PII was detected in this model's output or queries."
+        meta:
+          metrics:
+            model_pii_events:
+              type: sum
+              label: "PII Events"
+
+
+# ── FACT TABLES ───────────────────────────────────────────────────────────────
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: fct_ai_requests
+    description: >
+      One row per (tenant_id, request_id). The primary fact table for all
+      AI interactions. A "request" is a single user question → AI response cycle.
+
+      PURPOSE: the central hub of the star schema. Join dimension tables here
+      to answer questions like "which users made HIGH-risk requests last week?"
+      or "what SQL did the AI generate for requests involving PII data?"
+
+      Grain: one user request (question + all events that fulfil it).
+      A request spans multiple raw events (SQL generation, policy check, model
+      invocation, etc.) — this table summarises them into one row.
+
+      Relationships (FK → dimension):
+        tenant_id + user_id        → dim_ai_users
+        tenant_id + workspace_id   → dim_ai_workspaces
+        tenant_id + primary_model  → dim_ai_models
+
+      Compliance fields in this table:
+        question_text    — verbatim question; required by SOX, MiFID II, APRA
+        sql_generated_text — exact SQL the AI wrote
+        sql_executed_text  — exact SQL that ran on the datasource
+    meta:
+      label: "AI Requests"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: tenant_id
+        description: >
+          Tenant / organisation identifier. Foreign key → dim_ai_workspaces,
+          dim_ai_users. All queries must filter by this first.
+        tests:
+          - not_null
+      - name: workspace_id
+        description: >
+          Workspace where the request originated.
+          Foreign key → dim_ai_workspaces (join on tenant_id + workspace_id).
+        tests:
+          - not_null
+      - name: user_id
+        description: >
+          User who submitted the question.
+          Foreign key → dim_ai_users (join on tenant_id + user_id).
+        tests:
+          - not_null
+      - name: session_id
+        description: >
+          Conversation session that contains this request. A session groups
+          related requests in a single conversation thread.
+          Join to rpt_session_overview (in trace_reporting) for session context.
+      - name: request_id
+        description: >
+          Primary key. Unique identifier for a single user question → AI
+          response cycle. Generated by the AI platform at request receipt.
+        tests:
+          - not_null
+      - name: etl_run_id
+        description: >
+          If this request triggered an ETL pipeline, the corresponding run ID
+          from agents/etl/audit.py. Use to cross-reference ETL audit logs with
+          the AI interaction that initiated the pipeline run.
+      - name: request_started_at
+        description: >
+          UTC timestamp when the AI platform received the user's question
+          (the REQUEST_RECEIVED event timestamp).
+        meta:
+          dimension:
+            type: timestamp
+      - name: request_ended_at
+        description: >
+          UTC timestamp when the AI returned its final response to the user
+          (the RESPONSE_RETURNED event timestamp). Null if request is still in
+          progress or ended in error before returning.
+        meta:
+          dimension:
+            type: timestamp
+      - name: total_request_ms
+        description: >
+          End-to-end latency in milliseconds from question receipt to response
+          delivery. Calculated as request_ended_at − request_started_at.
+          Use to identify slow requests or SLA breaches.
+        meta:
+          metrics:
+            avg_request_latency_ms:
+              type: average
+              label: "Avg Request Latency (ms)"
+      - name: question_text
+        description: >
+          COMPLIANCE FIELD. The verbatim question the user typed.
+          Credential patterns (API keys, passwords, tokens) are masked before
+          storage. All business content is preserved.
+          Regulatory requirement: SOX, MiFID II, APRA CPS 234, and FedRAMP
+          require recording who asked what sensitive question at what time.
+      - name: sql_generated_text
+        description: >
+          COMPLIANCE FIELD. The exact SQL query the AI wrote in response to
+          the question. This is the query only — NOT the data it returned.
+          Required for data access audit to show what the AI intended to query.
+      - name: sql_executed_text
+        description: >
+          COMPLIANCE FIELD. The exact SQL that was actually executed on the
+          datasource (may differ from sql_generated_text if modified by policy
+          or user before execution). This is the definitive data access record.
+      - name: sql_hash
+        description: >
+          SHA-256 fingerprint of the primary SQL for this request.
+          Use for deduplication, pattern matching, and comparing generated vs
+          executed SQL across requests.
+      - name: highest_sensitivity_level
+        description: >
+          The most sensitive data classification encountered across all events
+          in this request. Derived from sensitivity_level on all child events.
+          Values: LOW → MEDIUM → HIGH → CRITICAL.
+          CRITICAL = request touched regulated, classified, or PII data.
+        meta:
+          dimension:
+            type: string
+      - name: pii_detected
+        description: >
+          True if any event in this request detected PII (Personally
+          Identifiable Information) in the query or generated content.
+          Even if PII data was not ultimately returned, its presence in the
+          query must be recorded for compliance.
+      - name: all_pii_fields
+        description: >
+          JSON array of all PII field / column names encountered across events
+          in this request. Contains field names only — never actual PII values.
+          Example: ["email", "ssn", "date_of_birth", "phone_number"].
+      - name: agent_actions_taken
+        description: >
+          Human-readable summary of what autonomous AI agents did to fulfil
+          this request. Describes actions (tool calls, data access, decisions)
+          — not the data content retrieved.
+      - name: agent_event_count
+        description: >
+          Number of autonomous agent actions taken to fulfil this request.
+          Zero for pure conversational requests; higher for agentic workflows
+          involving tool calls, ETL, or multi-step reasoning.
+        meta:
+          metrics:
+            avg_agent_events_per_request:
+              type: average
+              label: "Avg Agent Events per Request"
+      - name: boundary_violated
+        description: >
+          1 (true) if any AI agent action during this request attempted to
+          exceed its allowed operational scope (e.g. DDL attempt, cross-tenant
+          access, accessing restricted schemas). Always investigate requests
+          where this is 1 — a potential security incident.
+        meta:
+          metrics:
+            requests_with_boundary_violation:
+              type: count_distinct
+              sql: "case when ${boundary_violated} = 1 then ${request_id} end"
+              label: "Requests with Boundary Violations"
+      - name: boundary_violation_risks
+        description: >
+          Comma-separated list of risk flags from any boundary violations
+          during this request. Example: "DDL_ATTEMPT, PII_SCHEMA_ACCESS".
+          These flags come from the risk_flags field on the violation events.
+      - name: primary_model
+        description: >
+          The main LLM model used for this request.
+          Foreign key → dim_ai_models (join on tenant_id + primary_model).
+      - name: datasources_touched
+        description: >
+          Comma-separated list of datasource connection aliases accessed during
+          this request. Multi-valued (denormalised). For individual datasource
+          events use fct_ai_sql_executions instead.
+      - name: sql_generated_count
+        description: "Number of SQL queries the AI generated for this request."
+        meta:
+          metrics:
+            total_sql_generated:
+              type: sum
+              label: "Total SQL Generated"
+      - name: sql_executed_count
+        description: "Number of generated SQL queries that successfully executed."
+        meta:
+          metrics:
+            total_sql_executed:
+              type: sum
+              label: "Total SQL Executed"
+      - name: sql_blocked_count
+        description: "Number of generated SQL queries blocked by governance policy."
+        meta:
+          metrics:
+            total_sql_blocked:
+              type: sum
+              label: "Total SQL Blocked"
+      - name: policy_blocks
+        description: >
+          Total number of governance policy checks that blocked an action
+          during this request. Covers SQL blocks, tool blocks, and agent blocks.
+        meta:
+          metrics:
+            total_policy_blocks:
+              type: sum
+              label: "Total Policy Blocks"
+      - name: policy_block_reason
+        description: >
+          Human-readable explanation of why the last (or most severe) policy
+          block occurred during this request.
+      - name: error_count
+        description: >
+          Total number of errors (model errors, SQL errors, tool errors) that
+          occurred during this request. A request may partially succeed with
+          some errors.
+        meta:
+          metrics:
+            total_errors:
+              type: sum
+              label: "Total Errors"
+      - name: human_corrections
+        description: >
+          Number of times a human user corrected or overrode the AI's output
+          during this request (human_feedback_received events).
+        meta:
+          metrics:
+            total_human_corrections:
+              type: sum
+              label: "Human Corrections"
+      - name: risk_level
+        description: >
+          Overall risk classification for this request:
+            CRITICAL — agent boundary violation occurred
+            HIGH     — SQL query was blocked by policy
+            MEDIUM   — policy blocks, high sensitivity data, or PII involved
+            LOW      — minor errors or warnings only
+            NONE     — clean request with no risk events
+          Primary field for governance dashboards and risk-based filtering.
+        tests:
+          - accepted_values:
+              values: [NONE, LOW, MEDIUM, HIGH, CRITICAL]
+        meta:
+          dimension:
+            type: string
+      - name: request_status
+        description: >
+          Final outcome of the request:
+            ok        — completed and response returned to user
+            blocked   — request or primary action was blocked by policy
+            failed    — error prevented completion
+            violation — agent boundary violation occurred
+        meta:
+          dimension:
+            type: string
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: fct_ai_sql_generations
+    description: >
+      One row per SQL generation event (event_type = sql_generated).
+      Event-grain fact table for SQL audit, risk analysis, and pattern detection.
+
+      PURPOSE: answers "what SQL did the AI write, for which datasource, at
+      what sensitivity level, and did it involve PII?" The verbatim sql_text
+      field is the compliance-critical record.
+
+      Grain: one sql_generated event. A single user request may generate
+      multiple SQL queries (e.g. one per sub-question in a multi-part prompt).
+
+      Note: this table records generated SQL. To see what actually RAN, use
+      fct_ai_sql_executions. To find blocked SQL, check fct_ai_policy_checks.
+
+      Relationships (FK → dimension):
+        tenant_id + user_id         → dim_ai_users
+        tenant_id + datasource_name → dim_ai_datasources
+        tenant_id + model_name      → dim_ai_models
+        request_id                  → fct_ai_requests
+    meta:
+      label: "AI SQL Generations"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        description: >
+          Primary key. Unique identifier for this SQL generation event in the
+          trace ledger. Globally unique across all tenants.
+        tests:
+          - not_null
+          - unique
+      - name: parent_trace_id
+        description: >
+          Trace ID of the parent event — typically the request_received event
+          that triggered this SQL generation. Use to reconstruct the full
+          request timeline via the raw ledger.
+      - name: tenant_id
+        description: "Tenant identifier. Foreign key → dim_ai_users, dim_ai_datasources."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where this SQL was generated."
+      - name: user_id
+        description: >
+          User whose question triggered this SQL generation.
+          Foreign key → dim_ai_users (join on tenant_id + user_id).
+      - name: session_id
+        description: "Conversation session containing this SQL generation."
+      - name: request_id
+        description: >
+          Request that triggered this SQL generation.
+          Foreign key → fct_ai_requests (join on tenant_id + request_id).
+      - name: generated_at
+        description: "UTC timestamp when the AI produced this SQL query."
+        meta:
+          dimension:
+            type: timestamp
+      - name: generated_date
+        description: "Calendar date (UTC) of generation. Use for daily trend analysis."
+        meta:
+          dimension:
+            type: date
+      - name: sql_text
+        description: >
+          COMPLIANCE FIELD. The verbatim SQL query generated by the AI.
+          This is the query text only — NOT the data it returned.
+          Regulators (SOX, MiFID II, APRA CPS 234) require the exact query for
+          data access audits. Credentials are masked; all SQL structure preserved.
+      - name: sql_hash
+        description: >
+          SHA-256 fingerprint of sql_text. Use to:
+            - Detect repeated identical queries across users or sessions
+            - Compare generated SQL vs executed SQL (join to fct_ai_sql_executions)
+            - Deduplicate query patterns for risk analysis
+      - name: sensitivity_level
+        description: >
+          Data sensitivity classification for this SQL query:
+            LOW      — public or non-sensitive data
+            MEDIUM   — internal business data
+            HIGH     — confidential, financial, or access-restricted data
+            CRITICAL — PII, regulated data, or classified systems
+          Set by the policy engine or sensitivity classifier at generation time.
+        meta:
+          dimension:
+            type: string
+      - name: pii_detected
+        description: >
+          True if the policy engine or AI detected that this SQL query
+          references columns containing Personally Identifiable Information.
+          Even if blocked before execution, the detection must be recorded.
+        meta:
+          metrics:
+            pii_sql_generations:
+              type: count_distinct
+              sql: "case when ${pii_detected} = true then ${trace_id} end"
+              label: "SQL Generations with PII"
+      - name: pii_fields
+        description: >
+          JSON array of PII field / column names referenced in this SQL query.
+          Contains column names only — never actual data values.
+          Example: ["customer_email", "national_id", "credit_card_number"].
+      - name: ai_action_summary
+        description: >
+          Human-readable description of what the AI decided and why it
+          generated this SQL. Describes the reasoning and intent — not the
+          data content. Example: "Generated SELECT aggregating revenue by region;
+          applied tenant-level row filter and date range from user question."
+      - name: datasource_type
+        description: "Database technology of the target datasource (snowflake, bigquery, etc.)."
+        meta:
+          dimension:
+            type: string
+      - name: datasource_name
+        description: >
+          Named connection alias for the target datasource.
+          Foreign key → dim_ai_datasources (join on tenant_id + datasource_name).
+        meta:
+          dimension:
+            type: string
+      - name: model_name
+        description: >
+          LLM that generated this SQL.
+          Foreign key → dim_ai_models (join on tenant_id + model_name).
+        meta:
+          dimension:
+            type: string
+      - name: sql_risk_level
+        description: >
+          Risk classification for this specific SQL query:
+            CRITICAL — CRITICAL sensitivity classification
+            HIGH     — HIGH sensitivity classification
+            MEDIUM   — PII detected in the query
+            LOW      — no significant risk factors
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: policy_result
+        description: >
+          Governance policy decision applied to this SQL:
+            PASSED  — allowed to proceed to execution
+            BLOCKED — prevented from execution (see fct_ai_policy_checks for reason)
+            SKIPPED — policy check was not applicable for this event
+      - name: status
+        description: >
+          Outcome of the SQL generation event:
+            ok      — generated successfully and passed to next stage
+            blocked — blocked by policy before execution
+            failed  — generation error (e.g. model error, context overflow)
+      - name: error_code
+        description: "Machine-readable error code if status = failed."
+      - name: error_message
+        description: "Human-readable error description. Credentials redacted."
+      - name: etl_run_id
+        description: "ETL pipeline run ID if this SQL was generated as part of an ETL workflow."
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: fct_ai_sql_executions
+    description: >
+      One row per SQL execution event (event_type = sql_executed).
+      The definitive data access audit log — every query that actually ran.
+
+      PURPOSE: answers "what queries actually executed against which datasource,
+      by whom, and what data classifications did they involve?"
+      This is the table regulators and security teams use for data access review.
+
+      Grain: one sql_executed event. If a query was generated but blocked, it
+      appears only in fct_ai_sql_generations (and fct_ai_policy_checks),
+      NOT here.
+
+      Key audit use: join fct_ai_sql_generations on sql_hash to find cases
+      where the executed SQL differs from what was generated (indicates
+      human override or policy modification).
+
+      Relationships (FK → dimension):
+        tenant_id + user_id         → dim_ai_users
+        tenant_id + datasource_name → dim_ai_datasources
+        request_id                  → fct_ai_requests
+    meta:
+      label: "AI SQL Executions"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        description: "Primary key. Unique identifier for this SQL execution event."
+        tests:
+          - not_null
+          - unique
+      - name: parent_trace_id
+        description: >
+          Trace ID of the corresponding sql_generated or sql_validated event.
+          Join to fct_ai_sql_generations on parent_trace_id = trace_id to
+          compare what was generated vs what executed.
+      - name: tenant_id
+        description: "Tenant identifier. Foreign key → dim_ai_users, dim_ai_datasources."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where the query was executed."
+      - name: user_id
+        description: >
+          User whose request triggered this execution.
+          Foreign key → dim_ai_users (join on tenant_id + user_id).
+      - name: session_id
+        description: "Conversation session in which this execution occurred."
+      - name: request_id
+        description: >
+          Request that led to this execution.
+          Foreign key → fct_ai_requests (join on tenant_id + request_id).
+      - name: executed_at
+        description: "UTC timestamp when the SQL began execution on the datasource."
+        meta:
+          dimension:
+            type: timestamp
+      - name: executed_date
+        description: "Calendar date (UTC) of execution. Use for daily access trend analysis."
+        meta:
+          dimension:
+            type: date
+      - name: sql_text
+        description: >
+          COMPLIANCE FIELD. The exact SQL that ran against the datasource.
+          This is the query text only — NOT the result rows or data returned.
+          This is the primary audit field for data access investigations.
+          An auditor reviewing a potential data breach starts here.
+      - name: sql_hash
+        description: >
+          SHA-256 fingerprint of sql_text. Join to fct_ai_sql_generations
+          on (tenant_id, sql_hash) to verify the executed SQL matches what
+          the AI originally generated (detects unauthorised modifications).
+      - name: sensitivity_level
+        description: >
+          Sensitivity classification at execution time.
+          Same scale as fct_ai_sql_generations: LOW | MEDIUM | HIGH | CRITICAL.
+        meta:
+          dimension:
+            type: string
+      - name: pii_detected
+        description: "True if this execution query touched PII columns."
+        meta:
+          metrics:
+            pii_sql_executions:
+              type: count_distinct
+              sql: "case when ${pii_detected} = true then ${trace_id} end"
+              label: "SQL Executions with PII"
+      - name: pii_fields
+        description: >
+          JSON array of PII column names referenced in the executed query.
+          Names only — no data values.
+      - name: datasource_type
+        description: "Technology type of the datasource where this SQL executed."
+        meta:
+          dimension:
+            type: string
+      - name: datasource_name
+        description: >
+          Named connection alias where this SQL executed.
+          Foreign key → dim_ai_datasources (join on tenant_id + datasource_name).
+        meta:
+          dimension:
+            type: string
+      - name: model_name
+        description: >
+          LLM that originally generated this SQL.
+          Foreign key → dim_ai_models (join on tenant_id + model_name).
+        meta:
+          dimension:
+            type: string
+      - name: policy_result
+        description: "Final governance policy decision before execution (typically PASSED)."
+      - name: status
+        description: >
+          Execution outcome:
+            ok     — query executed successfully
+            failed — execution error (e.g. syntax error, permission denied, timeout)
+      - name: error_code
+        description: "Machine-readable error code if execution failed."
+      - name: error_message
+        description: "Human-readable error description. PII and credentials redacted."
+      - name: etl_run_id
+        description: "ETL pipeline run ID if this execution was part of an ETL workflow."
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: fct_ai_policy_checks
+    description: >
+      One row per governance policy check event. Covers all check outcomes:
+      passed, blocked (SQL, tool, or agent), and agent boundary violations.
+
+      PURPOSE: the complete governance enforcement log. Answers "what was the
+      AI trying to do, what did the policy engine decide, and why was it
+      blocked?" Required for compliance frameworks that mandate audit of
+      access control decisions (SOX, APRA, FedRAMP).
+
+      Grain: one policy evaluation event. A single request may produce many
+      policy check rows (e.g. one per SQL attempt, one per tool call).
+
+      Relationships (FK → dimension):
+        tenant_id + user_id        → dim_ai_users
+        tenant_id + datasource_name → dim_ai_datasources
+        tenant_id + model_name     → dim_ai_models
+        request_id                 → fct_ai_requests
+    meta:
+      label: "AI Policy Checks"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        description: "Primary key. Unique identifier for this policy check event."
+        tests:
+          - not_null
+          - unique
+      - name: parent_trace_id
+        description: >
+          Trace ID of the event that triggered this policy check.
+          Join back to the raw ledger (stg_trace_events) to see what
+          action was being evaluated.
+      - name: tenant_id
+        description: "Tenant identifier."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where the checked action originated."
+      - name: user_id
+        description: >
+          User whose action triggered the policy check.
+          Foreign key → dim_ai_users (join on tenant_id + user_id).
+      - name: session_id
+        description: "Session in which the check occurred."
+      - name: request_id
+        description: >
+          Request that triggered the check.
+          Foreign key → fct_ai_requests (join on tenant_id + request_id).
+      - name: checked_at
+        description: "UTC timestamp when the policy engine evaluated this action."
+        meta:
+          dimension:
+            type: timestamp
+      - name: check_date
+        description: "Calendar date (UTC) of the check. Use for daily policy audit reports."
+        meta:
+          dimension:
+            type: date
+      - name: event_type
+        description: >
+          The specific event type being evaluated:
+            policy_check_started     — evaluation initiated
+            policy_check_passed      — action allowed
+            policy_check_failed      — action blocked by policy rule
+            sql_blocked              — SQL query specifically blocked
+            agent_boundary_violation — agent attempted out-of-scope action
+        meta:
+          dimension:
+            type: string
+      - name: policy_result
+        description: >
+          The policy engine's formal decision:
+            PASSED  — action was permitted
+            BLOCKED — action was prevented
+            SKIPPED — policy check was bypassed (reason in error_message)
+      - name: question_text
+        description: >
+          COMPLIANCE FIELD. The verbatim user question that led to this
+          policy check. Preserves context for auditors reviewing why an
+          action was attempted.
+      - name: sql_text
+        description: >
+          COMPLIANCE FIELD. The SQL query or action text being evaluated by
+          the policy engine. Recorded verbatim for compliance audit.
+      - name: sql_hash
+        description: "SHA-256 fingerprint of the evaluated SQL."
+      - name: sensitivity_level
+        description: "Sensitivity classification of the content being evaluated."
+        meta:
+          dimension:
+            type: string
+      - name: pii_detected
+        description: "True if the evaluated content involved PII."
+      - name: pii_fields
+        description: "JSON array of PII field names involved in this policy check."
+      - name: agent_name
+        description: >
+          Name of the autonomous agent that triggered this check, if applicable
+          (e.g. "sql_agent", "etl_agent", "rag_agent"). Null for human-initiated checks.
+        meta:
+          dimension:
+            type: string
+      - name: ai_action_summary
+        description: >
+          Human-readable description of what the AI or agent was attempting
+          to do when this policy check was triggered.
+      - name: boundary_violated
+        description: >
+          True if an autonomous agent attempted an action outside its permitted
+          operational scope. This is the most severe policy violation type.
+      - name: risk_flags
+        description: >
+          JSON array of detected security or compliance risks on this event.
+          Values may include:
+            DDL_ATTEMPT          — agent tried to CREATE, DROP, or ALTER tables
+            WRITE_OPERATION      — agent tried to INSERT, UPDATE, or DELETE data
+            PII_SCHEMA_ACCESS    — agent accessed a schema containing PII columns
+            CROSS_TENANT_ACCESS  — agent tried to query another tenant's data
+            EXFILTRATION_RISK    — pattern consistent with data exfiltration
+            POLICY_OVERRIDE_ATTEMPT — agent tried to bypass governance rules
+      - name: is_policy_blocked
+        description: "True if this check resulted in a block, regardless of event_type."
+      - name: is_boundary_violation
+        description: >
+          True if this is an agent_boundary_violation event.
+          Use this field to filter for the most severe governance failures.
+        meta:
+          metrics:
+            total_boundary_violations:
+              type: count_distinct
+              sql: "case when ${is_boundary_violation} = true then ${trace_id} end"
+              label: "Boundary Violations"
+      - name: status
+        description: >
+          Outcome of this policy check event:
+            ok        — check passed, action allowed
+            blocked   — check failed, action blocked
+            violation — agent boundary violation (always blocked)
+      - name: error_code
+        description: "Machine-readable code identifying the specific policy rule triggered."
+      - name: error_message
+        description: >
+          Human-readable explanation of why the action was blocked or what
+          the policy violation was. PII and credentials redacted.
+      - name: check_outcome
+        description: >
+          Derived categorical outcome for easy filtering in Lightdash:
+            PASSED                    — action allowed
+            SQL_BLOCKED               — SQL query blocked
+            POLICY_FAILED             — non-SQL action blocked by policy
+            AGENT_BOUNDARY_VIOLATION  — agent exceeded allowed scope
+            OTHER                     — uncategorised
+        tests:
+          - accepted_values:
+              values: [PASSED, SQL_BLOCKED, POLICY_FAILED, AGENT_BOUNDARY_VIOLATION, OTHER]
+        meta:
+          dimension:
+            type: string
+      - name: datasource_name
+        description: >
+          Datasource involved in this check, if applicable.
+          Foreign key → dim_ai_datasources (join on tenant_id + datasource_name).
+      - name: model_name
+        description: >
+          LLM model involved in the check.
+          Foreign key → dim_ai_models (join on tenant_id + model_name).
+      - name: etl_run_id
+        description: "ETL run ID if this check was triggered by an ETL workflow."
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: fct_ai_tool_calls
+    description: >
+      One row per tool invocation or autonomous agent action. Covers three
+      event types: tool_invoked, agent_action, and agent_boundary_violation.
+
+      PURPOSE: the primary audit trail for AI agentic behaviour. Answers
+      "what did AI agents actually do autonomously — what tools did they call,
+      what data did they access, did they stay within bounds?"
+
+      This is the security team's first port of call for agentic incident review.
+      Every autonomous action an agent takes must appear here.
+
+      Grain: one tool call or agent action event.
+
+      Relationships (FK → dimension):
+        tenant_id + user_id         → dim_ai_users  (user on whose behalf agent acted)
+        tenant_id + datasource_name → dim_ai_datasources
+        request_id                  → fct_ai_requests
+    meta:
+      label: "AI Tool Calls"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        description: "Primary key. Unique identifier for this tool call or agent action event."
+        tests:
+          - not_null
+          - unique
+      - name: parent_trace_id
+        description: >
+          Trace ID of the parent event (typically the user request that triggered
+          the tool call). Use to reconstruct the full agentic workflow chain.
+      - name: tenant_id
+        description: "Tenant identifier."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where the tool call originated."
+      - name: user_id
+        description: >
+          User on whose behalf this tool or agent action was taken.
+          Foreign key → dim_ai_users (join on tenant_id + user_id).
+      - name: session_id
+        description: "Session in which this invocation occurred."
+      - name: request_id
+        description: >
+          Request that triggered this invocation.
+          Foreign key → fct_ai_requests (join on tenant_id + request_id).
+      - name: invoked_at
+        description: "UTC timestamp when the tool or agent action was initiated."
+        meta:
+          dimension:
+            type: timestamp
+      - name: invoked_date
+        description: "Calendar date (UTC) of invocation. Use for daily agent activity reports."
+        meta:
+          dimension:
+            type: date
+      - name: event_type
+        description: >
+          The specific event type:
+            tool_invoked             — explicit tool call made by a model
+            agent_action             — autonomous decision and action by an agent
+            agent_boundary_violation — agent attempted to exceed allowed scope
+        meta:
+          dimension:
+            type: string
+      - name: actor_type
+        description: >
+          Who or what initiated this call:
+            tool  — a specific tool was directly invoked
+            agent — an autonomous agent made an independent decision
+        meta:
+          dimension:
+            type: string
+      - name: actor_id
+        description: >
+          Identifier of the actor — typically the agent name or tool name.
+          Useful for grouping all actions by a specific agent or tool.
+      - name: tool_name
+        description: >
+          Name of the specific tool called (e.g. "run_sql", "ingest_file",
+          "search_schema", "vector_search", "memory_lookup").
+          Null for pure agent_action events where no specific tool is named.
+        meta:
+          dimension:
+            type: string
+      - name: agent_name
+        description: >
+          Name of the autonomous agent that performed this action
+          (e.g. "sql_agent", "etl_agent", "rag_agent", "orchestrator").
+          Null for direct tool_invoked events not associated with an agent.
+        meta:
+          dimension:
+            type: string
+      - name: ai_action_summary
+        description: >
+          Human-readable description of what the tool or agent did.
+          Describes the action and its intent — not the data content accessed.
+          Example: "Ingested sales_q4.csv into staging.sales; wrote 1,500 rows."
+      - name: boundary_violated
+        description: >
+          True if this action attempted to exceed the agent's allowed operational
+          scope. Should never be true in normal operation.
+          Examples of violations: DDL on production tables, cross-tenant reads,
+          accessing schemas not in the agent's permission list.
+        meta:
+          metrics:
+            agentic_boundary_violations:
+              type: count_distinct
+              sql: "case when ${boundary_violated} = true then ${trace_id} end"
+              label: "Agent Boundary Violations"
+      - name: is_boundary_violation
+        description: >
+          True if this row is specifically an agent_boundary_violation event
+          (as opposed to a regular tool_invoked with boundary_violated=true).
+          Use this to filter strictly for the recorded violation events.
+      - name: risk_flags
+        description: >
+          JSON array of security or compliance risks detected on this tool call.
+          Values may include: DDL_ATTEMPT, WRITE_OPERATION, PII_SCHEMA_ACCESS,
+          CROSS_TENANT_ACCESS, EXFILTRATION_RISK, BOUNDARY_VIOLATION.
+      - name: sql_text
+        description: >
+          COMPLIANCE FIELD. SQL executed by the tool or agent, if any.
+          The exact query only — not the result data.
+      - name: sql_hash
+        description: "SHA-256 fingerprint of any SQL executed by this tool call."
+      - name: sensitivity_level
+        description: "Sensitivity classification of data accessed by this tool call."
+        meta:
+          dimension:
+            type: string
+      - name: pii_detected
+        description: "True if PII was involved in this tool call (query or retrieved content)."
+        meta:
+          metrics:
+            tool_calls_with_pii:
+              type: count_distinct
+              sql: "case when ${pii_detected} = true then ${trace_id} end"
+              label: "Tool Calls with PII"
+      - name: pii_fields
+        description: "JSON array of PII column names involved. Names only — never values."
+      - name: datasource_type
+        description: "Type of datasource accessed by this tool call."
+        meta:
+          dimension:
+            type: string
+      - name: datasource_name
+        description: >
+          Named datasource accessed.
+          Foreign key → dim_ai_datasources (join on tenant_id + datasource_name).
+        meta:
+          dimension:
+            type: string
+      - name: policy_result
+        description: "Governance policy decision for this tool call."
+      - name: is_policy_blocked
+        description: "True if this tool call was blocked by the governance policy engine."
+      - name: status
+        description: >
+          Outcome of this tool call or agent action:
+            ok        — completed successfully within allowed scope
+            blocked   — blocked by governance policy
+            violation — agent boundary violation (always results in block)
+            failed    — unexpected error during execution
+      - name: error_code
+        description: "Machine-readable error code if the tool call failed or was blocked."
+      - name: error_message
+        description: "Human-readable explanation. Credentials and PII redacted."
+      - name: tool_call_risk_level
+        description: >
+          Risk classification for this specific tool call:
+            CRITICAL — boundary violation occurred
+            HIGH     — blocked by policy or HIGH sensitivity data accessed
+            MEDIUM   — PII detected in the tool call
+            LOW      — no significant risk factors
+        tests:
+          - accepted_values:
+              values: [CRITICAL, HIGH, MEDIUM, LOW]
+        meta:
+          dimension:
+            type: string
+      - name: etl_run_id
+        description: "ETL pipeline run ID if this tool call was part of an ETL workflow."
+
+
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: fct_ai_rag_retrievals
+    description: >
+      One row per RAG (Retrieval-Augmented Generation) or memory retrieval event.
+      Covers rag_retrieved and memory_retrieved event types.
+
+      PURPOSE: answers "what external knowledge did the AI pull in to answer
+      this question — from which store, with what sensitivity classification,
+      and was PII present in the retrieved context?"
+
+      RAG allows the AI to answer questions grounded in your organisation's
+      private documents and data. This table makes that retrieval process
+      auditable and traceable.
+
+      Grain: one retrieval event. A single request may trigger multiple
+      retrievals (e.g. multiple vector searches or memory lookups).
+
+      Relationships (FK → dimension):
+        tenant_id + user_id         → dim_ai_users
+        tenant_id + datasource_name → dim_ai_datasources  (the retrieval store)
+        tenant_id + model_name      → dim_ai_models
+        request_id                  → fct_ai_requests
+    meta:
+      label: "AI RAG Retrievals"
+      group_label: "Traceability — Facts"
+    columns:
+      - name: trace_id
+        description: "Primary key. Unique identifier for this retrieval event."
+        tests:
+          - not_null
+          - unique
+      - name: parent_trace_id
+        description: >
+          Trace ID of the request event that triggered this retrieval.
+          Use to link retrievals back to the user question that prompted them.
+      - name: tenant_id
+        description: "Tenant identifier."
+        tests:
+          - not_null
+      - name: workspace_id
+        description: "Workspace where the retrieval was triggered."
+      - name: user_id
+        description: >
+          User whose request triggered this retrieval.
+          Foreign key → dim_ai_users (join on tenant_id + user_id).
+      - name: session_id
+        description: "Conversation session in which the retrieval occurred."
+      - name: request_id
+        description: >
+          Request that triggered this retrieval.
+          Foreign key → fct_ai_requests (join on tenant_id + request_id).
+      - name: retrieved_at
+        description: "UTC timestamp when the retrieval query was executed."
+        meta:
+          dimension:
+            type: timestamp
+      - name: retrieved_date
+        description: "Calendar date (UTC) of retrieval. Use for daily retrieval trend analysis."
+        meta:
+          dimension:
+            type: date
+      - name: event_type
+        description: >
+          Retrieval type:
+            rag_retrieved    — vector store / document chunk retrieval.
+                               The AI searched your document corpus to find
+                               relevant passages to include in its response.
+            memory_retrieved — persistent conversation memory or user context
+                               was fetched (e.g. prior conversation history,
+                               user preferences, saved summaries).
+        meta:
+          dimension:
+            type: string
+      - name: context_refs
+        description: >
+          JSON array of retrieved chunk IDs or memory item IDs.
+          Use to trace exactly which documents or memory fragments were used
+          to construct the AI's response. This enables full provenance audit:
+          "the AI said X because it retrieved document chunk Y from store Z."
+      - name: ai_action_summary
+        description: >
+          Description of what the AI was searching for and what it retrieved.
+          Example: "Searched product documentation for pricing policy; retrieved
+          3 chunks from knowledge_base matching query 'discount approval'."
+      - name: sensitivity_level
+        description: >
+          Sensitivity classification of the retrieved context.
+          If the retrieved documents contain confidential data, this will be
+          HIGH or CRITICAL even if the user's question was low-risk.
+        meta:
+          dimension:
+            type: string
+      - name: pii_detected
+        description: >
+          True if PII was present in the retrieved chunks or memory content.
+          This is important: even if the user's question did not ask for PII,
+          the retrieval system may have returned documents that contain it.
+        meta:
+          metrics:
+            rag_retrievals_with_pii:
+              type: count_distinct
+              sql: "case when ${pii_detected} = true then ${trace_id} end"
+              label: "RAG Retrievals with PII"
+      - name: pii_fields
+        description: >
+          JSON array of PII field names present in the retrieved content.
+          Names only — never actual PII values.
+      - name: datasource_type
+        description: >
+          Technology of the retrieval store. Examples:
+            vector_db — embedding vector store (Pinecone, Weaviate, pgvector)
+            memory    — conversation memory store
+            document  — document store (S3, GCS, SharePoint)
+        meta:
+          dimension:
+            type: string
+      - name: datasource_name
+        description: >
+          Named retrieval store connection alias.
+          Foreign key → dim_ai_datasources (join on tenant_id + datasource_name).
+        meta:
+          dimension:
+            type: string
+      - name: tool_name
+        description: >
+          Name of the retrieval tool used.
+          Examples: "vector_search", "memory_lookup", "document_search".
+        meta:
+          dimension:
+            type: string
+      - name: model_name
+        description: >
+          LLM model that requested this retrieval.
+          Foreign key → dim_ai_models (join on tenant_id + model_name).
+        meta:
+          dimension:
+            type: string
+      - name: status
+        description: >
+          Outcome of the retrieval:
+            ok     — retrieved successfully; context passed to the model
+            failed — retrieval error (store unavailable, timeout, empty result)
+      - name: error_code
+        description: "Machine-readable error code if the retrieval failed."
+      - name: error_message
+        description: "Human-readable error description. PII and credentials redacted."
+      - name: etl_run_id
+        description: "ETL run ID if this retrieval was part of an ETL-triggered workflow."
